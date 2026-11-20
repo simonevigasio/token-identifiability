@@ -1,0 +1,12 @@
+.deps/
+features/
+results/
+figures/
+.cache/
+__pycache__/
+*.egg-info/
+.venv/
+.venv-aau/
+logs/*
+!logs/.gitkeep
+.pytest_cache/
