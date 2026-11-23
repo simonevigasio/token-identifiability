@@ -111,6 +111,10 @@ class ELFObservation:
     latent_std: float = 0.2      # train_owt_ELF-B.yml
     noise_scale: float = 2.0     # denoiser_noise_scale, used only if t < 1
     noise_seed: int = 0
+    # Second half of the input. "zero": no self-conditioning (first sampling step, and the
+    # decoder step). "pred": ELF's own x-prediction from a first forward pass with zero
+    # self-conditioning, as in the later steps of sampling (_forward_sample_self_cond).
+    self_cond: str = "zero"
 
 
 class ELFExtractor:
@@ -119,6 +123,10 @@ class ELFExtractor:
             raise ValueError("mode must be 'denoiser' or 'decoder'")
         if not 0.0 <= observation.t <= 1.0:
             raise ValueError("t must be in [0, 1]")
+        if observation.self_cond not in {"zero", "pred"}:
+            raise ValueError("self_cond must be 'zero' or 'pred'")
+        if observation.self_cond == "pred" and observation.mode == "decoder":
+            raise ValueError("ELF's decoder step always uses zero self-conditioning")
         self.encoder = encoder.eval().requires_grad_(False)
         self.elf = elf.eval().requires_grad_(False)
         if not isinstance(self.elf.feat_rope, VariableLengthRoPE):
@@ -145,9 +153,14 @@ class ELFExtractor:
             gen = torch.Generator(device="cpu").manual_seed(obs.noise_seed * 1_000_003 + index)
             noise = torch.randn(z.shape, generator=gen).to(dev)
             z = obs.t * z + (1.0 - obs.t) * noise * obs.noise_scale
-        inputs = torch.cat([z, torch.zeros_like(z)], dim=-1)  # zero self-conditioning
         t = torch.full((1,), obs.t, device=dev)
         cfg = torch.full((1,), obs.cfg_scale, device=dev)
+        decoder = obs.mode == "decoder"
+        inputs = torch.cat([z, torch.zeros_like(z)], dim=-1)  # zero self-conditioning
+        if obs.self_cond == "pred":
+            x_pred, _ = self.elf(inputs, t, attention_mask=mask, deterministic=True,
+                                 self_cond_cfg_scale=cfg, decoder_step_active=decoder)
+            inputs = torch.cat([z, x_pred], dim=-1)
 
         captured = {}
         # The language rows are always the last n rows (prefix tokens are prepended).
@@ -158,7 +171,7 @@ class ELFExtractor:
                 lambda _m, _i, out, l=l: captured.__setitem__(l, out[0, -n:].clone())))
         try:
             self.elf(inputs, t, attention_mask=mask, deterministic=True, self_cond_cfg_scale=cfg,
-                     decoder_step_active=obs.mode == "decoder")
+                     decoder_step_active=decoder)
         finally:
             for h in hooks:
                 h.remove()

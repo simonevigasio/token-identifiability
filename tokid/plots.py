@@ -197,7 +197,8 @@ def fig_pipeline(t5_res, elf_res, out):
     ax.set_xticks(np.concatenate([xs_t5, xs_elf]))
     ax.set_xticklabels([str(l) for l in t5_layers[t5_keep]] + ["in" if l == 0 else str(l) for l in elf_layers])
     ax.set(xlabel="Layer", ylabel="Identifiability rate",
-           title=f"Token identifiability along tokens -> T5-small -> ELF-B ({elf_res['meta']['dataset'].upper()})")
+           title=f"Token identifiability along tokens -> T5-small -> ELF-B "
+                 f"({elf_res['meta'].get('tag', 'elf-b')}, {elf_res['meta']['dataset'].upper()})")
     ax.title.set_fontsize(9)
     ax.legend(ncol=3)
     save(fig, out, "pipeline_identifiability")

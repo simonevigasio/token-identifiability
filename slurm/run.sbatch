@@ -4,6 +4,8 @@
 #   sbatch --array=0-2 slurm/run.sbatch          # one GPU job per model: 0=t5-small 1=t5-base 2=elf-b
 #   DATASETS="mrpc cola mnli" sbatch --array=0-2 slurm/run.sbatch   # + Appendix D
 #   MODELS="elf-b" sbatch --array=0 slurm/run.sbatch                # a single model
+#   MODELS="elf-inference" sbatch --array=0-5 slurm/run.sbatch      # ELF as in standard inference:
+#       0=decoder t=1, 1-5=denoiser t=0.1,0.3,0.5,0.7,0.9 (see scripts/models.sh)
 #
 # AI-LAB allows at most 12 h per job. Shortly before the limit, the job requeues itself
 # (up to MAX_RESTARTS times). The experiments resume from their .partial checkpoints and
@@ -22,7 +24,8 @@
 set -uo pipefail
 source "${SLURM_SUBMIT_DIR:?submit with sbatch from the repository root}/slurm/common.sh"
 
-read -r -a ALL_MODELS <<< "${MODELS:-t5-small t5-base elf-b}"
+source scripts/models.sh
+read -r -a ALL_MODELS <<< "$(expand_models "${MODELS:-t5-small t5-base elf-b}")"
 if [ -n "${SLURM_ARRAY_TASK_ID:-}" ]; then
   export MODELS=${ALL_MODELS[$SLURM_ARRAY_TASK_ID]:?array index out of range for MODELS}
 else

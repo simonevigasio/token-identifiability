@@ -7,6 +7,8 @@
 #
 # Environment overrides:
 #   MODELS="t5-small t5-base elf-b"  FOLDS=10  DEVICE=auto  PY=python
+#   MODELS="elf-inference"    (ELF as in standard inference: decoder t=1 + denoiser t<1,
+#                              see scripts/models.sh; can be mixed with other models)
 #   EXTRA="--lr-search"   (extra flags for every experiment)
 #   HF_CACHE=/path        (HuggingFace cache dir; default: HF default)
 # Finished steps are skipped, so the script can simply be re-run after an interruption.
@@ -15,7 +17,8 @@ cd "$(dirname "$0")/.."
 
 DATASETS=(mrpc)
 if [ $# -gt 0 ]; then DATASETS=("$@"); fi
-MODELS=${MODELS:-"t5-small t5-base elf-b"}
+source scripts/models.sh   # ELF variant names, elf-inference
+MODELS=$(expand_models "${MODELS:-t5-small t5-base elf-b}")
 FOLDS=${FOLDS:-10}
 DEVICE=${DEVICE:-auto}
 PY=${PY:-python}
@@ -23,7 +26,7 @@ EXTRA=${EXTRA:-}
 CACHE_ARGS=()
 [ -n "${HF_CACHE:-}" ] && CACHE_ARGS=(--cache-dir "$HF_CACHE")
 
-if [[ " $MODELS " == *" elf-b "* ]] && [ ! -d .deps/elf-pytorch ]; then
+if [[ " $MODELS " == *" elf-b"* ]] && [ ! -d .deps/elf-pytorch ]; then
   $PY scripts/prepare_elf.py
 fi
 
@@ -40,6 +43,8 @@ for ds in "${DATASETS[@]}"; do
     if [ ! -f "$feats" ]; then
       case $model in
         elf-b) $PY -m tokid.extract --model elf --dataset "$ds" --device "$DEVICE" ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} --out "$feats" ;;
+        elf-b_*) $PY -m tokid.extract --model elf --variant "$model" --dataset "$ds" --device "$DEVICE" \
+                   ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} --out "$feats" ;;
         t5-*)  $PY -m tokid.extract --model t5 --t5-name "google-t5/$model" --dataset "$ds" --device "$DEVICE" \
                    ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} --out "$feats" ;;
         *) echo "unknown model $model"; exit 1 ;;
@@ -49,15 +54,19 @@ for ds in "${DATASETS[@]}"; do
     run_exp "$feats" identity      "$res/identity_token.json"   --target token   # Fig. 2a, 2b, 7, 8-10
     run_exp "$feats" hidden2hidden "$res/hidden2hidden.json"                     # App. B.4, Fig. 11
     run_exp "$feats" neighbours    "$res/neighbours_token.json" --target token   # App. B.5, Fig. 14-17
-    if [ "$model" = elf-b ]; then
+    if [[ $model == elf-b* ]]; then
       # Literal analogue of BERT's x_i: the rows entering ELF block 1.
       run_exp "$feats" identity "$res/identity_input.json" --target input
     fi
     $PY -m tokid.plots --results "$res" --out "figures/${model}_${ds}"
   done
   # Whenever both exist (also when each model ran in its own Slurm array task).
-  if [ -f "results/t5-small_${ds}/identity_token.json" ] && [ -f "results/elf-b_${ds}/identity_token.json" ]; then
-    $PY -m tokid.plots --pipeline "results/t5-small_${ds}" "results/elf-b_${ds}" --out "figures/pipeline_${ds}"
-  fi
+  for model in $MODELS; do
+    [[ $model == elf-b* ]] || continue
+    name=${model#elf-b}   # "" for elf-b, else e.g. "_decoder_cfg3"
+    if [ -f "results/t5-small_${ds}/identity_token.json" ] && [ -f "results/${model}_${ds}/identity_token.json" ]; then
+      $PY -m tokid.plots --pipeline "results/t5-small_${ds}" "results/${model}_${ds}" --out "figures/pipeline${name}_${ds}"
+    fi
+  done
 done
 echo "All done. Tables: figures/*/summary.md"

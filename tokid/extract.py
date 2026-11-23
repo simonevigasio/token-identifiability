@@ -25,7 +25,12 @@ def resolve_device(name: str) -> torch.device:
     return torch.device(name)
 
 
+ELF_DEFAULTS = {"elf_t": 1.0, "elf_mode": "denoiser", "elf_cfg_scale": 1.0, "elf_self_cond": "zero"}
+
+
 def model_tag(args) -> str:
+    """File tag of a feature set; for ELF it encodes every non-default observation setting,
+    e.g. ``elf-b``, ``elf-b_decoder_cfg3``, ``elf-b_t0.3_cfg3_scpred``."""
     if args.model == "t5":
         return args.t5_name.split("/")[-1]
     tag = "elf-b"
@@ -33,7 +38,31 @@ def model_tag(args) -> str:
         tag += f"_t{args.elf_t:g}"
     if args.elf_mode != "denoiser":
         tag += f"_{args.elf_mode}"
+    if args.elf_cfg_scale != 1.0:
+        tag += f"_cfg{args.elf_cfg_scale:g}"
+    if args.elf_self_cond != "zero":
+        tag += f"_sc{args.elf_self_cond}"
     return tag
+
+
+def parse_elf_tag(tag: str) -> dict:
+    """Inverse of model_tag for ELF: ``elf-b_t0.3_cfg3_scpred`` -> the --elf-* settings."""
+    head, *parts = tag.split("_")
+    if head != "elf-b":
+        raise ValueError(f"not an ELF tag: {tag!r}")
+    out = dict(ELF_DEFAULTS)
+    for part in parts:
+        if part == "decoder":
+            out["elf_mode"] = "decoder"
+        elif part.startswith("cfg"):
+            out["elf_cfg_scale"] = float(part[3:])
+        elif part.startswith("sc"):
+            out["elf_self_cond"] = part[2:]
+        elif part.startswith("t"):
+            out["elf_t"] = float(part[1:])
+        else:
+            raise ValueError(f"unknown part {part!r} in ELF tag {tag!r}")
+    return out
 
 
 def extract(extractor, tokenizer, texts, add_eos=True, log_every=100):
@@ -79,7 +108,11 @@ def main(argv=None):
     p.add_argument("--elf-t", type=float, default=1.0, help="Flow time; 1.0 = clean input (default).")
     p.add_argument("--elf-mode", choices=["denoiser", "decoder"], default="denoiser")
     p.add_argument("--elf-cfg-scale", type=float, default=1.0)
+    p.add_argument("--elf-self-cond", choices=["zero", "pred"], default="zero",
+                   help="Self-conditioning input: zero (default) or ELF's own x-prediction (denoiser only).")
     p.add_argument("--elf-noise-seed", type=int, default=0)
+    p.add_argument("--variant", default=None,
+                   help="ELF tag that sets all --elf-* options at once, e.g. elf-b_t0.3_cfg3_scpred.")
     p.add_argument("--cache-dir", default=None, help="HuggingFace cache directory.")
     p.add_argument("--local-files-only", action="store_true")
     p.add_argument("--device", default="auto")
@@ -87,6 +120,24 @@ def main(argv=None):
     p.add_argument("--out", type=Path, default=None)
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args(argv)
+    if args.variant is not None:
+        if args.model != "elf":
+            p.error("--variant is only for --model elf")
+        try:
+            settings = parse_elf_tag(args.variant)
+        except ValueError as e:
+            p.error(str(e))
+        set_by_hand = [k for k, v in ELF_DEFAULTS.items() if getattr(args, k) != v]
+        if set_by_hand:
+            p.error(f"--variant cannot be combined with {', '.join('--' + k.replace('_', '-') for k in set_by_hand)}")
+        vars(args).update(settings)
+        if model_tag(args) != args.variant:
+            p.error(f"non-canonical variant {args.variant!r}; write it as {model_tag(args)!r}")
+    if args.model == "elf":  # fail before loading anything
+        if args.elf_self_cond == "pred" and args.elf_mode == "decoder":
+            p.error("ELF's decoder step always uses zero self-conditioning (--elf-self-cond zero)")
+        if not 0.0 <= args.elf_t <= 1.0:
+            p.error("--elf-t must be in [0, 1]")
 
     out = args.out or args.out_dir / f"{model_tag(args)}_{args.dataset}.pt"
     if out.exists() and not args.overwrite:
@@ -98,7 +149,7 @@ def main(argv=None):
         extractor, tokenizer, meta = load_t5(args.t5_name, args.cache_dir, args.local_files_only, device)
     else:
         obs = ELFObservation(t=args.elf_t, mode=args.elf_mode, cfg_scale=args.elf_cfg_scale,
-                             noise_seed=args.elf_noise_seed)
+                             noise_seed=args.elf_noise_seed, self_cond=args.elf_self_cond)
         extractor, tokenizer, meta = load_elf(args.elf_source, obs, args.cache_dir, args.local_files_only,
                                               args.elf_checkpoint, device)
     texts = load_texts(args.dataset, args.max_examples, args.pair_format, args.cache_dir)

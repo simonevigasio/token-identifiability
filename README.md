@@ -56,7 +56,31 @@ Section 4 and Appendix B, with BERT replaced by:
   * `--target input`: recover ELF's own block-1 input rows (768-d). This is the literal
     analogue of BERT's `x_i`, and the naive baseline is defined.
   * Options: `--elf-t <t>` (noisy input `z_t = t·z + (1−t)·2·ε`, noise seeded per
-    sentence) and `--elf-mode decoder`. They are not used by default.
+    sentence), `--elf-mode decoder`, `--elf-cfg-scale <s>` and `--elf-self-cond pred`.
+    They are not used by default.
+* **ELF as in standard inference** (`MODELS=elf-inference`). The default `elf-b` (denoiser
+  at t = 1) is a setting ELF never meets when generating. Official sampling
+  (`.deps/elf-pytorch/src/utils/sampling_utils.py`) evaluates the denoiser only at t < 1:
+  every ODE/SDE step calls the network at the step's *start* time, so the last step goes
+  from `t_steps[-2]` to 1 without a call at t = 1. Then one decoder step at t = 1
+  (model-mode tokens on, zero self-conditioning) maps the latent to tokens
+  (`generation.py: _dlm_decode_batch`). `elf-inference` covers both, with self-cond. CFG
+  token 3 as in `uncond_sampling_configs.yml`:
+
+  | tag | mode | t | self-conditioning |
+  |---|---|---|---|
+  | `elf-b_decoder_cfg3` | decoder | 1 | zero |
+  | `elf-b_t{0.1,0.3,0.5,0.7,0.9}_cfg3_scpred` | denoiser | 0.1 … 0.9 | ELF's own x̂ |
+
+  `scpred`: during sampling the second half of the input is the previous step's
+  x-prediction. Here a first forward pass with zero self-conditioning gives x̂, and the
+  states are read from a second pass on `[z_t, x̂]`. This is exactly two sampler calls at
+  the same t (`tests/test_models.py` checks it against upstream `_forward_sample_self_cond`).
+  Note that sampling draws t from logit-normal(−1.5, 0.8) (median t ≈ 0.18, 90% below
+  ≈ 0.38). The input `z_t` is a noised real sentence, as in training, not a sampler
+  trajectory, so the true tokens are known.
+  Variant names are feature tags: `--variant <tag>` sets all `--elf-*` options
+  (`scripts/models.sh`).
 * **Pipeline figure.** `figures/pipeline_<ds>/` puts T5-small blocks 1–6 and ELF-B
   in, 1–12 on one axis. It shows how token identity decays through ELF's whole stack.
 
@@ -99,6 +123,8 @@ srun --mem=24G --cpus-per-task=8 --gres=gpu:1 --time=01:00:00 bash slurm/setup.s
 sbatch --array=0-2 slurm/run.sbatch
 #    + Appendix D datasets:
 DATASETS="mrpc cola mnli" sbatch --array=0-2 slurm/run.sbatch
+#    ELF as in standard inference (0=decoder t=1, 1-5=denoiser t=0.1..0.9):
+MODELS=elf-inference sbatch --array=0-5 slurm/run.sbatch
 
 # 3. monitor
 squeue --me
@@ -117,6 +143,9 @@ tail -f logs/tokid_<jobid>_2.out
   `HF_HOME`, `MAX_RESTARTS`. Also set: `PYTHONNOUSERSITE=1` (ignore `~/.local`),
   `OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK`, `PYTHONUNBUFFERED=1`.
 * AI Cloud: add a partition if your account needs one, e.g. `sbatch -p prioritized --array=0-2 ...`.
+* Figures are made automatically at the end of each job. To (re)generate all of them:
+  `srun --mem=8G --cpus-per-task=2 --time=00:30:00 bash slurm/plots.sh`. Then copy them
+  to your laptop: `rsync -av <user>@<front-end>:<repo>/figures ./`.
 
 The first run downloads T5-small/base, the ELF-B checkpoint (~0.8 GB) and GLUE from the
 Hugging Face Hub. Set `HF_HOME` or `HF_CACHE=...` to choose where they are stored.
@@ -130,7 +159,8 @@ bash scripts/run_all.sh                 # MRPC (main text)
 bash scripts/run_all.sh mrpc cola mnli  # + Appendix D
 ```
 
-Environment knobs: `MODELS="t5-small elf-b"`, `FOLDS=10`, `DEVICE=cuda`, `EXTRA="--lr-search"`,
+Environment knobs: `MODELS="t5-small elf-b"` (or `elf-inference`, or any ELF tag such as
+`elf-b_t0.3_cfg3_scpred`), `FOLDS=10`, `DEVICE=cuda`, `EXTRA="--lr-search"`,
 `PY=python`. Finished steps are skipped, so after an interruption just re-run the same command.
 The `neighbours` experiment costs about 6× `identity`, since it trains one probe set per offset.
 
@@ -139,6 +169,7 @@ Single steps:
 ```bash
 python -m tokid.extract --model elf --dataset mrpc                               # features/elf-b_mrpc.pt
 python -m tokid.extract --model t5 --t5-name google-t5/t5-small --dataset mrpc   # features/t5-small_mrpc.pt
+python -m tokid.extract --model elf --variant elf-b_decoder_cfg3 --dataset mrpc  # features/elf-b_decoder_cfg3_mrpc.pt
 python -m tokid.experiments --features features/elf-b_mrpc.pt --experiment identity --target token
 python -m tokid.experiments --features features/elf-b_mrpc.pt --experiment hidden2hidden
 python -m tokid.experiments --features features/elf-b_mrpc.pt --experiment neighbours
@@ -152,6 +183,7 @@ python -m tokid.plots --pipeline results/t5-small_mrpc results/elf-b_mrpc --out 
   `hidden` ((L+1)×N×d), texts, metadata (revisions, lengths).
 * `results/<model>_<dataset>/*.json`: per-fold, per-layer rates (`test`, `train`, `val`, the
   `cross` layer matrix), best epochs, learning rates, splits.
+* `figures/pipeline[_<variant>]_<dataset>/`: T5-small + ELF on one axis, for `elf-b` and every ELF variant.
 * `figures/<model>_<dataset>/`: `summary.md` (all tables, mean ± std over folds),
   `identity_token/fig2a_identifiability.png`, `fig2b_crosslayer_linear_cos.png`,
   `fig7_generalization_l2.png`, `fig8–10_*`, `hidden2hidden/fig11_*`,
@@ -169,6 +201,6 @@ tokid/identify.py     within-sentence nearest-neighbour identification
 tokid/experiments.py  CLI: identity / hidden2hidden / neighbours
 tokid/plots.py        CLI: figures + summary tables
 tokid/prefetch.py     CLI: download all models/datasets once
-scripts/prepare_elf.py, scripts/run_all.sh
+scripts/prepare_elf.py, scripts/run_all.sh, scripts/models.sh (ELF variants)
 slurm/common.sh, slurm/setup.sh, slurm/run.sbatch   AAU AI-LAB / AI Cloud
 ```

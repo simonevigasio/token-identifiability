@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
 from transformers import T5Config, T5EncoderModel
 
 from tokid.models import DEFAULT_ELF_SOURCE, ELFExtractor, ELFObservation, T5Extractor, VariableLengthRoPE
@@ -73,3 +74,54 @@ def test_elf_noise_is_seeded(tiny_elf):
     a, b, c = ext(ids, index=0), ext(ids, index=0), ext(ids, index=1)
     torch.testing.assert_close(a["hidden"][2], b["hidden"][2])
     assert not torch.allclose(a["hidden"][2], c["hidden"][2])
+
+
+def _noisy_latent(enc, ids, obs, index=0):
+    z = enc(input_ids=ids[None]).last_hidden_state / obs.latent_std
+    gen = torch.Generator().manual_seed(obs.noise_seed * 1_000_003 + index)
+    return obs.t * z + (1 - obs.t) * torch.randn(z.shape, generator=gen) * obs.noise_scale
+
+
+def test_elf_self_cond_pred_matches_upstream_sampler(tiny_elf):
+    """--elf-self-cond pred = upstream _forward_sample_self_cond fed its own x-prediction."""
+    from types import SimpleNamespace
+    import importlib
+
+    _, elf = tiny_elf
+    enc = tiny_t5()
+    obs = ELFObservation(t=0.3, cfg_scale=3.0, self_cond="pred", noise_seed=1)
+    out = ELFExtractor(enc, elf, obs)(torch.tensor([5, 7, 9, 5, 1]), index=2)
+    su = importlib.import_module("utils.sampling_utils")  # upstream, on sys.path via import_elf
+    cfg = SimpleNamespace(t_eps=0.05, self_cond_prob=0.5, num_self_cond_cfg_tokens=4)
+    with torch.no_grad():
+        z_t = _noisy_latent(enc, torch.tensor([5, 7, 9, 5, 1]), obs, index=2)
+        t = torch.full((1,), 0.3)
+        # as upstream _generate_samples_single_batch does for unconditional generation
+        step = dict(model=elf, z=z_t, t_batch=t, config=cfg, self_cond_cfg_scale=3.0,
+                    cond_seq=torch.zeros_like(z_t), cond_seq_mask=torch.zeros(z_t.shape[:2]))
+        _, x_first = su._forward_sample_self_cond(x_pred_prev=torch.zeros_like(z_t), **step)
+        _, x_second = su._forward_sample_self_cond(x_pred_prev=x_first, **step)
+        torch.testing.assert_close(elf.final_layer(out["hidden"][-1][None]), x_second)
+        inp = torch.cat([z_t, x_first], -1)
+        torch.testing.assert_close(out["hidden"][0], elf.text_proj(elf.self_cond_proj(inp))[0])
+
+
+def test_elf_decoder_matches_upstream_decode(tiny_elf):
+    """Decoder mode = the input of upstream _dlm_decode_batch's final step (t = 1, CFG token)."""
+    _, elf = tiny_elf
+    enc = tiny_t5()
+    ids = torch.tensor([5, 7, 9, 5, 1])
+    out = ELFExtractor(enc, elf, ELFObservation(mode="decoder", cfg_scale=3.0))(ids)
+    with torch.no_grad():
+        z = enc(input_ids=ids[None]).last_hidden_state / 0.2
+        _, logits = elf(torch.cat([z, torch.zeros_like(z)], -1), torch.ones(1), deterministic=True,
+                        self_cond_cfg_scale=torch.full((1,), 3.0), decoder_step_active=True)
+        h = out["hidden"][-1][None]
+        torch.testing.assert_close(F.gelu(h @ elf.proj_kernel + elf.proj_bias, approximate="tanh")
+                                   @ elf.unembed_kernel + elf.unembed_bias, logits)
+
+
+def test_elf_self_cond_pred_rejected_for_decoder(tiny_elf):
+    _, elf = tiny_elf
+    with pytest.raises(ValueError):
+        ELFExtractor(tiny_t5(), elf, ELFObservation(mode="decoder", self_cond="pred"))
