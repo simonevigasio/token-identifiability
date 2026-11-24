@@ -17,8 +17,18 @@ input   x_i = hidden[0], the rows entering the first transformer block (literal
         analogue of BERT's input embedding). Same as ``token`` for T5; for ELF it is
         the projected T5 latent in ELF's 768-d space.
 
+Splits (``--split``), i.e. how general the probe g_l is:
+
+sentence      the paper's random 70/15/15 split by sentence (default).
+domain        leave-one-domain-out (features with domain labels, e.g. docmix): fold k
+              trains on all other domains and tests on domain k.
+unseen-token  sentence split, and the test tokens are word types never used as
+              training/validation targets (about 15% of token occurrences).
+With domain labels, the test rate is also reported per domain (``test_by_domain``).
+
 Example:
     python -m tokid.experiments --features features/elf-b_mrpc.pt --experiment identity
+    python -m tokid.experiments --features features/elf-b-xsum_t0.3_docmix.pt --experiment identity --split domain
 """
 
 import argparse
@@ -34,7 +44,7 @@ import torch
 from tokid.extract import resolve_device
 from tokid.identify import nn_rate, vector_keys
 from tokid.probes import make_probe, predict, train_probe
-from tokid.splits import sentence_splits
+from tokid.splits import domain_splits, sentence_splits, unseen_token_splits
 
 
 LR_GRID = [3e-3, 1e-3, 3e-4, 1e-4, 3e-5, 1e-5, 3e-6]  # App. B.1
@@ -51,6 +61,9 @@ class Task:
     cand: torch.Tensor      # (Gy, N, d_out)
     cand_sent: torch.Tensor  # (N,)
     cand_key: torch.Tensor  # (Gy, N)
+    query_type: torch.Tensor = None    # (Q,) token id of each query's target (unseen-token split)
+    query_domain: torch.Tensor = None  # (Q,) domain index of each query (per-domain rates)
+    domain_names: list = None
 
     @property
     def naive_ok(self):
@@ -76,11 +89,24 @@ def target_vectors(feats, target):
     raise ValueError(target)
 
 
+def query_info(feats, q=None, offset=0):
+    """Target token id and domain index of the queries ``q`` (all tokens if None)."""
+    sent = feats["sentence_ids"]
+    q = torch.arange(sent.numel(), device=sent.device) if q is None else q
+    info = {"query_type": feats["token_ids"][q + offset]}
+    if feats.get("domains") is not None:
+        names = feats["meta"]["domain_names"]
+        dom = torch.tensor([names.index(d) for d in feats["domains"]], device=sent.device)
+        info.update(query_domain=dom[sent[q]], domain_names=names)
+    return info
+
+
 def identity_task(feats, target):
     hidden, sent = feats["hidden"], feats["sentence_ids"]
     tgt = target_vectors(feats, target)
     keys = vector_keys(tgt)
-    return Task(list(range(hidden.shape[0])), hidden, tgt[None], sent, keys[None], tgt[None], sent, keys[None])
+    return Task(list(range(hidden.shape[0])), hidden, tgt[None], sent, keys[None], tgt[None], sent, keys[None],
+                **query_info(feats))
 
 
 def neighbour_task(feats, target, offset):
@@ -90,21 +116,42 @@ def neighbour_task(feats, target, offset):
     tgt = target_vectors(feats, target)
     keys = vector_keys(tgt)
     return Task(list(range(hidden.shape[0])), hidden[:, q], tgt[None, q + offset], sent[q], keys[None, q + offset],
-                tgt[None], sent, keys[None])
+                tgt[None], sent, keys[None], **query_info(feats, q, offset))
 
 
 def hidden2hidden_task(feats):
     hidden, sent = feats["hidden"], feats["sentence_ids"]
     prev = hidden[:-1]
     keys = vector_keys(prev)
-    return Task(list(range(1, hidden.shape[0])), hidden[1:], prev, sent, keys, prev, sent, keys)
+    return Task(list(range(1, hidden.shape[0])), hidden[1:], prev, sent, keys, prev, sent, keys, **query_info(feats))
 
 
 def split_indices(task, split):
+    """Query indices of train / val / test. With ``test_types`` (unseen-token split), test
+    keeps only those target types and train / val exclude them."""
     out = {}
-    for name, sents in split.items():
-        chosen = torch.as_tensor(sents, device=task.query_sent.device, dtype=task.query_sent.dtype)
-        out[name] = torch.nonzero(torch.isin(task.query_sent, chosen), as_tuple=True)[0]
+    held = None
+    if "test_types" in split:
+        held = torch.isin(task.query_type, torch.as_tensor(split["test_types"], device=task.query_type.device,
+                                                           dtype=task.query_type.dtype))
+    for name in ("train", "val", "test"):
+        chosen = torch.as_tensor(split[name], device=task.query_sent.device, dtype=task.query_sent.dtype)
+        keep = torch.isin(task.query_sent, chosen)
+        if held is not None:
+            keep &= held if name == "test" else ~held
+        out[name] = torch.nonzero(keep, as_tuple=True)[0]
+    return out
+
+
+def rates_by_domain(task, pred, idx, metric):
+    """{domain: per-layer rate} over the queries ``idx`` (domains present in idx only)."""
+    if task.query_domain is None:
+        return None
+    dom = task.query_domain[idx]
+    out = {}
+    for d in torch.unique(dom).tolist():
+        sel = dom == d
+        out[task.domain_names[d]] = task.rate(pred[:, sel], idx[sel], metric).tolist()
     return out
 
 
@@ -190,12 +237,17 @@ def run_task(task, folds, args, cross_layer, label="", ckpt=None, prefix=""):
                 t0 = time.time()
                 seed = args.seed * 100_000 + k * 100 + ci
                 model, info = fit(task, idx, probe, loss, lrs[(probe, loss)], args, seed)
+                pred_te = predict(model, task.x[:, te])
                 rec = {
-                    "test": task.rate(predict(model, task.x[:, te]), te, loss).tolist(),
+                    "test": task.rate(pred_te, te, loss).tolist(),
                     "train": task.rate(predict(model, task.x[:, idx["train"]]), idx["train"], loss).tolist(),
                     "val": task.rate(predict(model, task.x[:, idx["val"]]), idx["val"], loss).tolist(),
                     "best_epoch": info["best_epoch"], "epochs_run": info["epochs_run"],
                 }
+                by_domain = rates_by_domain(task, pred_te, te, loss)
+                if by_domain is not None:
+                    rec["test_by_domain"] = by_domain
+                del pred_te
                 if cross_layer:  # Fig. 2b: g trained on layer a, tested on every layer b
                     with torch.no_grad():
                         rec["cross"] = [task.rate(model.single(a, task.x[:, te]), te, loss).tolist()
@@ -214,6 +266,10 @@ def run_task(task, folds, args, cross_layer, label="", ckpt=None, prefix=""):
                 cfg[f"{key}_mean"], cfg[f"{key}_std"] = arr.mean(0).tolist(), arr.std(0).tolist()
         if "cross" in cfg:
             cfg["cross_mean"] = np.asarray(cfg["cross"]).mean(0).tolist()
+        if "test_by_domain" in cfg:  # mean over the folds in which the domain was tested
+            names = sorted({d for fold in cfg["test_by_domain"] for d in fold})
+            cfg["test_by_domain_mean"] = {d: np.mean([f[d] for f in cfg["test_by_domain"] if d in f], 0).tolist()
+                                          for d in names}
     return res
 
 
@@ -225,7 +281,9 @@ def main(argv=None):
     p.add_argument("--probes", nargs="+", choices=["linear", "mlp"], default=["linear", "mlp"])
     p.add_argument("--losses", nargs="+", choices=["cos", "l2"], default=["cos", "l2"])
     p.add_argument("--offsets", nargs="+", type=int, default=[-1, -2, -3, 1, 2, 3])
-    p.add_argument("--folds", type=int, default=10)
+    p.add_argument("--folds", type=int, default=10, help="Folds of the sentence / unseen-token splits.")
+    p.add_argument("--split", choices=["sentence", "domain", "unseen-token"], default="sentence",
+                   help="sentence: paper (default). domain: leave-one-domain-out. unseen-token: test on held-out word types.")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--lr-search", action="store_true", help="Search LR_GRID on fold 0 (App. B.1).")
     p.add_argument("--lr-grid", type=float, nargs="+", default=LR_GRID)
@@ -241,6 +299,8 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     suffix = "" if args.experiment == "hidden2hidden" else f"_{args.target}"
+    if args.split != "sentence":
+        suffix += f"_{args.split}"
     out = args.out or Path("results") / args.features.stem / f"{args.experiment}{suffix}.json"
     if out.exists() and not args.overwrite:
         p.error(f"{out} exists (use --overwrite)")
@@ -249,14 +309,22 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     feats = load_features(args.features, device)
     meta = feats["meta"]
-    folds = sentence_splits(meta["num_sentences"], args.folds, seed=args.seed)
+    if args.split == "domain":
+        if feats.get("domains") is None:
+            p.error("--split domain needs features with domain labels (e.g. --dataset docmix)")
+        folds = domain_splits(feats["domains"], meta["domain_names"], seed=args.seed)
+    elif args.split == "unseen-token":
+        folds = unseen_token_splits(meta["num_sentences"], feats["token_ids"].cpu().numpy(), args.folds, seed=args.seed)
+    else:
+        folds = sentence_splits(meta["num_sentences"], args.folds, seed=args.seed)
     print(f"[{args.experiment}] {meta['tag']} / {meta['dataset']}: {meta['num_tokens']} tokens, "
           f"{meta['num_sentences']} sentences, hidden {tuple(feats['hidden'].shape)}, target={args.target}, "
-          f"device={device}", flush=True)
+          f"split={args.split} ({len(folds)} folds), device={device}", flush=True)
     result = {"meta": meta, "experiment": args.experiment,
               "target": None if args.experiment == "hidden2hidden" else args.target,
               "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
-              "folds": [{k: v.tolist() for k, v in f.items()} for f in folds]}
+              "split": args.split,
+              "folds": [{k: v.tolist() if hasattr(v, "tolist") else v for k, v in f.items()} for f in folds]}
     settings = {k: v for k, v in result["args"].items() if k not in ("device", "log_every", "out", "overwrite")}
     partial = out.with_name(out.name + ".partial")
     if args.overwrite and partial.exists():

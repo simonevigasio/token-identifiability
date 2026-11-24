@@ -154,3 +154,57 @@ def train_probe(model, x_train, y_train, x_val, y_val, loss: str, lr: float = 1e
     return model, {"best_epoch": best_epoch.tolist(), "best_val_loss": best_val.tolist(),
                    "layer_epochs": stop_epoch.tolist(), "epochs_run": epoch + 1,
                    "stopped_early": epoch + 1 < max_epochs}
+
+
+# ------------------------------------------------------------ model selection (tokid.selection)
+
+class BatchedProbe(nn.Module):
+    """G independent probes of a configurable architecture (the search space of
+    tokid.selection): optional fixed input standardization, ``len(hidden)`` GELU layers
+    of the given widths, dropout after each hidden layer, and an output layer. Biases
+    are always used in hidden layers and optional in the output layer, so
+    ``hidden=()`` / ``bias=False`` is the paper's linear probe and ``hidden=(1000,)`` /
+    ``bias=True`` its MLP. Glorot-uniform weights, zero biases."""
+
+    def __init__(self, groups: int, d_in: int, d_out: int, hidden=(), bias: bool = False, dropout: float = 0.0,
+                 mean=None, std=None, generator=None):
+        super().__init__()
+        dims = [d_in, *hidden, d_out]
+        self.weights = nn.ParameterList()
+        self.biases = nn.ParameterList()
+        for i, (a, b) in enumerate(zip(dims[:-1], dims[1:])):
+            w = nn.Parameter(torch.empty(groups, a, b))
+            glorot_uniform_(w, a, b, generator)
+            self.weights.append(w)
+            if i < len(dims) - 2 or bias:
+                self.biases.append(nn.Parameter(torch.zeros(groups, 1, b)))
+        self.out_bias = bias
+        self.dropout = dropout
+        self.register_buffer("mean", None if mean is None else mean.reshape(groups, 1, d_in).float())
+        self.register_buffer("inv_std", None if std is None else (1.0 / std.clamp_min(1e-6)).reshape(groups, 1, d_in).float())
+
+    def forward(self, x):                        # x: (G, B, d_in)
+        x = x.float()
+        if self.mean is not None:
+            x = (x - self.mean) * self.inv_std
+        last = len(self.weights) - 1
+        for i, w in enumerate(self.weights):
+            has_bias = i < last or self.out_bias
+            x = torch.baddbmm(self.biases[i], x, w) if has_bias else torch.bmm(x, w)
+            if i < last:
+                x = F.gelu(x)
+                if self.dropout and self.training:
+                    x = F.dropout(x, self.dropout, training=True)
+        return x
+
+
+def info_nce_loss(pred, cand, cand_mask, slot, tau: float):
+    """Per-layer contrastive loss: softmax over the candidate tokens of each query's own
+    prompt (cosine similarity / tau), cross-entropy with the true token.
+
+    pred: (G, B, d); cand: (B, U, d) unit-norm candidates (padded); cand_mask: (B, U) True
+    where a candidate exists; slot: (B,) index of the true token among them."""
+    logits = torch.einsum("gbd,bud->gbu", F.normalize(pred, dim=-1), cand) / tau
+    logits = logits.masked_fill(~cand_mask[None], float("-inf"))
+    groups = pred.shape[0]
+    return F.cross_entropy(logits.flatten(0, 1), slot.repeat(groups), reduction="none").view(groups, -1).mean(-1)

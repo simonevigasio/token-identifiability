@@ -50,7 +50,8 @@ def load(path):
 def title_of(res):
     m = res["meta"]
     tgt = f", target={res['target']}" if res.get("target") else ""
-    return f"{m['tag']} on {m['dataset'].upper()}{tgt}"
+    split = f", split={res['split']}" if res.get("split", "sentence") != "sentence" else ""
+    return f"{m['tag']} on {m['dataset'].upper()}{tgt}{split}"
 
 
 def trivial_layer0(res):
@@ -204,6 +205,169 @@ def fig_pipeline(t5_res, elf_res, out):
     save(fig, out, "pipeline_identifiability")
 
 
+SPLIT_LABEL = {"sentence": "in-domain (sentence split)", "domain": "leave-one-domain-out",
+               "unseen-token": "unseen word types"}
+
+
+def fig_generalization(results, out):
+    """How general g_l is: the same probe config under the three splits, per layer, and
+    per held-out domain (in-domain vs leave-one-domain-out)."""
+    by_split = {r.get("split", "sentence"): r for r in results.values()
+                if r["experiment"] == "identity" and r.get("target") == "token"}
+    if len(by_split) < 2:
+        return
+    ref = next(iter(by_split.values()))
+    layers, keep = layer_axis(ref)
+    elf0 = not trivial_layer0(ref)
+    configs = [c for c in order(ref["configs"]) if not c.startswith("naive")]
+    for cfg in configs:
+        fig, ax = plt.subplots(figsize=(4.8, 3.4))
+        for i, split in enumerate(s for s in SPLIT_LABEL if s in by_split):
+            y = np.asarray(by_split[split]["configs"][cfg]["test_mean"])[keep]
+            ax.plot(layers[keep], y, color=SERIES[i], marker="o", label=SPLIT_LABEL[split])
+        xticks(ax, layers[keep], elf0)
+        ax.set(xlabel="Layer", ylabel="Identifiability rate",
+               title=f"Generality of g_l, {label(cfg)} - {ref['meta']['tag']}")
+        ax.title.set_fontsize(9)
+        ax.legend()
+        save(fig, out, f"generalization_{cfg}")
+        if {"sentence", "domain"} <= by_split.keys():
+            ind = by_split["sentence"]["configs"][cfg].get("test_by_domain_mean", {})
+            ood = by_split["domain"]["configs"][cfg].get("test_by_domain_mean", {})
+            names = [d for d in ref["meta"].get("domain_names") or [] if d in ind and d in ood]
+            if not names:
+                continue
+            fig, axes = plt.subplots(1, len(names), figsize=(2.2 * len(names), 3.0), sharey=True)
+            for ax, d in zip(np.atleast_1d(axes), names):
+                ax.plot(layers[keep], np.asarray(ind[d])[keep], color=SERIES[0], marker="o", label="in-domain")
+                ax.plot(layers[keep], np.asarray(ood[d])[keep], color=SERIES[1], marker="o", label="held out")
+                ax.set_title(d, fontsize=9)
+                ax.set_xlabel("Layer")
+                ax.set_xticks(layers[keep][::2])
+            np.atleast_1d(axes)[0].set_ylabel("Identifiability rate")
+            np.atleast_1d(axes)[0].legend()
+            fig.suptitle(f"Per domain, {label(cfg)} - {ref['meta']['tag']}", fontsize=9)
+            save(fig, out, f"generalization_by_domain_{cfg}")
+
+
+def _seq_cmap():
+    from matplotlib.colors import LinearSegmentedColormap
+
+    return LinearSegmentedColormap.from_list("seq_blue", [SURFACE, SERIES[0], "#0d2f5c"])
+
+
+def fig_selection(res, out):
+    """Model-selection protocol (tokid.selection): test identifiability per layer of the
+    selected g_l (in-distribution and OOD test documents, 95% bootstrap CI) against the
+    paper's probes; per-source and per-length breakdowns of the selected g_l."""
+    layers = np.asarray(res["layers"])
+    elf0 = not trivial_layer0({"meta": res["meta"], "configs": {}})
+    tag = res["meta"]["tag"]
+    fig, ax = plt.subplots(figsize=(5.6, 3.6))
+    sel = res["test"]["selected"]
+    for name, ls in (("id", "-"), ("ood", "--")):
+        if name not in sel:
+            continue
+        a = sel[name]["all"]
+        ax.fill_between(layers, a["lo"], a["hi"], color=SERIES[0], alpha=0.15, linewidth=0)
+        ax.plot(layers, a["rate"], color=SERIES[0], linestyle=ls, marker="o",
+                label=f"selected g_l, {'in-distribution' if name == 'id' else 'OOD'} test")
+    for i, cfg in enumerate(("paper_mlp_cos", "paper_linear_cos")):
+        if cfg in res["test"] and "id" in res["test"][cfg]:
+            ax.plot(layers, res["test"][cfg]["id"]["all"]["rate"], color=SERIES[1 + i], linewidth=1.2, marker="o",
+                    markersize=3, label=f"paper {cfg.split('_')[1]} (cos), in-distribution")
+    xticks(ax, layers, elf0)
+    ax.set(xlabel="Layer", ylabel="Test identifiability rate", ylim=(0, 1.02),
+           title=f"Selected probes vs paper probes - {tag}")
+    ax.title.set_fontsize(9)
+    ax.legend(loc="lower left")
+    save(fig, out, "selection_layers")
+
+    rows, names = [], []
+    for name in ("id", "ood"):
+        for src, v in (sel.get(name, {}).get("by_source") or {}).items():
+            if v is not None:
+                rows.append(v["rate"])
+                names.append(src + (" (OOD)" if name == "ood" else ""))
+    if rows:
+        fig, ax = plt.subplots(figsize=(0.45 * len(layers) + 2.4, 0.28 * len(rows) + 1.2))
+        im = ax.imshow(np.asarray(rows), aspect="auto", cmap=_seq_cmap(), vmin=0, vmax=1)
+        ax.set_yticks(range(len(names)), names)
+        ax.set_xticks(range(len(layers)), ["in" if (l == 0 and elf0) else str(l) for l in layers])
+        ax.grid(False)
+        ax.set(xlabel="Layer", title=f"Selected g_l, test rate per source - {tag}")
+        ax.title.set_fontsize(9)
+        fig.colorbar(im, ax=ax, label="Identifiability rate", fraction=0.04)
+        save(fig, out, "selection_by_source")
+
+    by_len = sel.get("id", {}).get("by_length") or {}
+    if by_len:
+        fig, ax = plt.subplots(figsize=(4.8, 3.4))
+        for i, (L, v) in enumerate(sorted(by_len.items(), key=lambda kv: int(kv[0]))):
+            ax.plot(layers, v["rate"], color=SERIES[i], marker="o", label=f"{L} tokens")
+        xticks(ax, layers, elf0)
+        ax.set(xlabel="Layer", ylabel="Test identifiability rate", ylim=(0, 1.02),
+               title=f"Selected g_l by prompt length (in-distribution) - {tag}")
+        ax.title.set_fontsize(9)
+        ax.legend(title="prompt length")
+        save(fig, out, "selection_by_length")
+
+
+def describe_config(cfg):
+    arch = cfg["arch"] if cfg["arch"] != "mlp" else f"mlp {cfg['depth']}x{cfg['width']}"
+    extra = [f"lr {cfg['lr']:.1e}", f"wd {cfg['weight_decay']:g}", f"bs {cfg['batch_size']}"]
+    if cfg["dropout"]:
+        extra.append(f"dropout {cfg['dropout']:g}")
+    if cfg["standardize"]:
+        extra.append("std. input")
+    loss = cfg["loss"] + (f" (tau {cfg['tau']:.3f})" if cfg["loss"] == "infonce" else "")
+    return f"{arch}, {loss}, " + ", ".join(extra)
+
+
+def selection_summary(name, res):
+    layers = res["layers"]
+    head = "| | " + " | ".join(str(l) for l in layers) + " |"
+    sep = "|---" * (len(layers) + 1) + "|"
+
+    def row(label, a):
+        return f"| {label} | " + " | ".join(f"{r:.3f} [{lo:.3f}, {hi:.3f}]"
+                                            for r, lo, hi in zip(a["rate"], a["lo"], a["hi"])) + " |"
+
+    sp = res["splits"]
+    lines = [f"## {name}: Model selection - {res['meta']['tag']} on {res['meta']['dataset']}", "",
+             f"{len(sp['dev'])} dev / {len(sp['test_id'])} in-distribution test / {len(sp['test_ood'])} OOD test "
+             f"prompts (OOD sources: {', '.join(res['meta'].get('ood_domains', []))}). Search: "
+             f"{len(res['pool'])} configurations, halving rounds {res['args']['rungs']} epochs, "
+             f"{len(res['finalists'])} finalists, {res['args']['cv_folds']}-fold CV on dev; refit with "
+             f"{res['args']['seeds']} seeds. Test rate [95% bootstrap CI over prompts]; column = layer.", "",
+             "Selected configuration per layer (CV mean validation rate is optimistic, it was maximised):", "",
+             "| layer | config | CV val rate |", "|---|---|---|"]
+    for l, (c, v) in enumerate(zip(res["chosen"], res["chosen_cv_rate"])):
+        lines.append(f"| {layers[l]} | {c}: {describe_config(res['pool'][c])} | {v:.3f} |")
+    lines += ["", "Test rates:", "", head, sep]
+    for test in ("id", "ood"):
+        if test in res["test"]["selected"]:
+            lines.append(row(f"selected, {test}", res["test"]["selected"][test]["all"]))
+            lines.append(row(f"selected, {test}, unseen token types",
+                             res["test"]["selected"][test]["unseen_types"]))
+    for key, val in res["test"].items():
+        if key == "selected":
+            continue
+        for test in ("id", "ood"):
+            if test in val:
+                lines.append(row(f"{key}, {test}", val[test]["all"]))
+    for test in ("id", "ood"):
+        sel = res["test"]["selected"].get(test)
+        if not sel:
+            continue
+        lines += ["", f"Selected g_l per source ({test}):", "", head, sep]
+        lines += [row(src, v) for src, v in sel["by_source"].items() if v is not None]
+        if test == "id":
+            lines += ["", "Selected g_l per prompt length (id):", "", head, sep]
+            lines += [row(f"{L} tokens", v) for L, v in sorted(sel["by_length"].items(), key=lambda kv: int(kv[0]))]
+    return lines + [""]
+
+
 def table(res, configs, layers, key="test_mean"):
     head = "| config | " + " | ".join(str(l) for l in layers) + " |"
     sep = "|---" * (len(layers) + 1) + "|"
@@ -222,6 +386,9 @@ def summary(results, out):
              "nearest same-sentence neighbour is the correct one). Column = layer "
              "(0 = input to the first block).", ""]
     for name, res in results.items():
+        if res["experiment"] == "selection":
+            lines += selection_summary(name, res)
+            continue
         m = res["meta"]
         lines += [f"## {name}: {title_of(res)}", "",
                   f"{m['num_sentences']} sentences, {m['num_tokens']} tokens "
@@ -233,6 +400,13 @@ def summary(results, out):
                           table(r, order(r["configs"]), r["layers"]), ""]
         else:
             lines += [table(res, order(res["configs"]), res["layers"]), ""]
+            for cfg in order(res["configs"]):
+                by_dom = res["configs"][cfg].get("test_by_domain_mean")
+                if by_dom:
+                    hold = " (each domain held out of training)" if res.get("split") == "domain" else ""
+                    lines += [f"Test rate per domain, {cfg}{hold}:", "",
+                              table({"configs": {d: {"test_mean": v} for d, v in by_dom.items()}},
+                                    list(by_dom), res["layers"]), ""]
             if any("train_mean" in c for c in res["configs"].values()):
                 tr = [c for c in order(res["configs"]) if "train_mean" in res["configs"][c]]
                 lines += ["Train-set rates (generalization, Fig. 7):", "",
@@ -265,11 +439,14 @@ def main(argv=None):
                 fig_identity(res, sub)
             elif res["experiment"] == "hidden2hidden":
                 fig_hidden2hidden(res, sub)
+            elif res["experiment"] == "selection":
+                fig_selection(res, sub)
             else:
                 fig_neighbours(res, sub)
         if results:
             out.mkdir(parents=True, exist_ok=True)
             summary(results, out)
+            fig_generalization(results, out / "generalization")
             print(f"wrote {out} ({len(results)} result files)")
 
 

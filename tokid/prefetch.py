@@ -3,7 +3,7 @@
 Afterwards the jobs can run with HF_HUB_OFFLINE=1 / HF_DATASETS_OFFLINE=1, so compute
 nodes never need network access.
 
-    python -m tokid.prefetch --models t5-small t5-base elf-b elf-b-de-en --datasets mrpc cola mnli wmt14
+    python -m tokid.prefetch --models t5-small t5-base elf-b elf-b-de-en elf-b-xsum --datasets mrpc cola mnli wmt14 docmix multidoc
 """
 
 import argparse
@@ -15,8 +15,8 @@ from tokid.models import DEFAULT_ELF_SOURCE, load_elf, load_t5
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--models", nargs="+", default=["t5-small", "t5-base", "elf-b", "elf-b-de-en"],
-                   choices=["t5-small", "t5-base", "elf-b", "elf-b-de-en"])
+    models = ["t5-small", "t5-base", "elf-b", "elf-b-de-en", "elf-b-xsum"]
+    p.add_argument("--models", nargs="+", default=models, choices=models)
     p.add_argument("--datasets", nargs="+", choices=DATASET_NAMES, default=DATASET_NAMES)
     p.add_argument("--elf-source", type=Path, default=DEFAULT_ELF_SOURCE)
     p.add_argument("--cache-dir", default=None)

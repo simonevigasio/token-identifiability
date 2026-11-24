@@ -10,6 +10,7 @@ Section 4 and Appendix B, with BERT replaced by:
 | `t5-base`  | `google-t5/t5-base` encoder | 12 | 768 | same size as BERT-base in the paper |
 | `elf-b`    | ELF-B (OWT, 105M, `embedded-language-flows/ELF-B-owt-torch`) | 12 | 768 | tokens → T5-small → ELF-B |
 | `elf-b-de-en` | ELF-B (WMT14 De→En, 105M, `embedded-language-flows/ELF-B-de-en-torch`) | 12 | 768 | prompt rows of a conditional ELF |
+| `elf-b-xsum` | ELF-B (XSum summarization, `embedded-language-flows/ELF-B-xsum-torch`) | 12 | 768 | prompt rows on the real sampling trajectory |
 
 ## Method (as in the paper)
 
@@ -114,6 +115,68 @@ Section 4 and Appendix B, with BERT replaced by:
   with `</s>`. `t5-small` on `wmt14` encodes the same prompts and gives the pipeline
   figure `figures/pipeline_de-en_<variant>_wmt14/`.
 
+* **Summarization ELF on its real sampling trajectory** (`MODELS="t5-small elf-xsum-inference"`).
+  The XSum checkpoint (`ELF-B-xsum-torch`, English article → one-sentence summary, 1088
+  rows, prompts ≤ 1024 tokens) is run exactly like upstream conditional generation, from
+  noise and with no reference target: 64-step logit-normal ODE schedule, CFG 2 on the
+  prompt, self-conditioning on the previous step's guided x-prediction, final decoder
+  step. The probe times 0.1, 0.3, 0.5, 0.7, 0.9 are always inserted into the schedule, so
+  every variant reads the same trajectory (`tokid.models.ELFTrajectoryExtractor`). The
+  states of the prompt rows are read at the first step (`elf-b-xsum_t0`), at the steps
+  starting at t = 0.1 … 0.9 (`elf-b-xsum_t0.1` …), and at the decoder step
+  (`elf-b-xsum_decoder`). Two datasets:
+  * `docmix`: 64 documents from each of 6 domains (XSum, web, Wikipedia, PubMed, law,
+    books), all cut to 255 tokens + `</s>`. Identity experiment with three splits:
+    by sentence, leave-one-domain-out, and unseen word types (`--split`).
+  * `multidoc`: **model selection of g_l with a locked test set** (`tokid/selection.py`),
+    described next.
+
+### Model selection of g_l (`multidoc`)
+
+Question: how well can *any* probe recover the token from layer l? The best probe found
+gives a lower bound on identifiability. Picking the best of many probes by its *test*
+score would overstate that bound, so no test document is ever used for a decision.
+
+* **Data, as varied as possible.** 3,099 prompts from 17 sources: XSum validation
+  articles plus 16 Pile test-split subsets (web, Wikipedia, StackExchange, GitHub,
+  USPTO, PubMed Central, FreeLaw, PubMed abstracts, arXiv, DM Mathematics, NIH,
+  HackerNews, Enron e-mails, EuroParl, Gutenberg, PhilPapers). Up to 200 documents
+  per source. Each prompt gets a length of 64, 128, 256 or 512 tokens, balanced per
+  source. 64 random positions per prompt are queries (198k in total), but **every token
+  of the prompt is a candidate**, so the lookup is as hard as when using all tokens.
+  Only the queries' hidden states are stored (float16, `<tag>_multidoc.hidden.npy`).
+* **Splits, fixed before training, by document** (`protocol_splits`):
+  * OOD test: every document of HackerNews and NIH (English prose, close to training)
+    and GitHub (code, far). Never used to train or select.
+  * In-distribution test: 20% of each other source, stratified by prompt length.
+  * Dev: the remaining 80%. All training and all choices use only these documents.
+* **Search** on a dev train/val split: 48 random configurations plus the paper's four
+  probes, by **successive halving**. Every configuration trains for 5 epochs and the best
+  third (a configuration survives if it ranks high for *some* layer) trains for 20 epochs.
+  The best 6 are the finalists. Search space: linear (no bias) / affine / MLP with 1–2
+  GELU layers of 512–2048 units; dropout; per-layer input standardization; loss cosine,
+  squared L2 or **contrastive** (InfoNCE over the prompt's own tokens, which is the
+  identification task itself, with a temperature); learning rate 1e-5–3e-3; AdamW weight
+  decay; batch size 256 / 1024. Cosine/contrastive probes are evaluated with cosine
+  nearest neighbours, L2 probes with Euclidean ones.
+* **Selection:** 4-fold cross-validation of the finalists on dev, with early stopping on
+  the validation identifiability rate. **Each layer picks its own configuration** (best
+  mean validation rate).
+* **Test, once:** each chosen configuration is retrained on all dev documents for the
+  median best epoch of its CV runs, with 3 seeds, and evaluated on both test sets. The
+  report gives the rate with a 95% bootstrap confidence interval over test documents, per
+  source, per prompt length, and for tokens whose type never occurred as a training
+  target. The paper's four probes (paper training procedure) are tested on the same
+  documents as a reference.
+* **Efficiency:** one sampling run per prompt writes all 7 trajectory points; queries
+  instead of all tokens keep ~8× more documents in the same memory; cheap halving rounds
+  weed out bad configurations; TF32 for probe training; every trained unit is
+  checkpointed (`results/<tag>_multidoc/selection.json.partial`), and so is the
+  extraction (every 100 prompts).
+* Note: T5's vocabulary has no `{`, `}`, `<` and similar characters, so code contains
+  many `<unk>` tokens. All of them share one embedding, so retrieving any `<unk>` counts
+  as correct (same rule as for repeated words).
+
 Implementation notes:
 * The G layers of a model are trained together as G independent probes: parameters have a
   leading layer dimension, the loss is the sum of per-layer losses, and early stopping and
@@ -157,6 +220,11 @@ DATASETS="mrpc cola mnli" sbatch --array=0-2 slurm/run.sbatch
 MODELS=elf-inference sbatch --array=0-5 slurm/run.sbatch
 #    translation ELF-B, prompt rows (0=t5-small, 1=t=0, 2-6=t=0.1..0.9 scpred, 7=decoder):
 MODELS="t5-small elf-de-en-inference" DATASETS=wmt14 sbatch --array=0-7 slurm/run.sbatch
+#    summarization ELF-B, model selection of g_l: extraction (all 7 ELF points in one job), then
+#    one selection job per variant (0=t5-small, 1=t=0, 2-6=t=0.1..0.9, 7=decoder):
+jid=$(MODELS="t5-small elf-b-xsum_t0" DATASETS=multidoc STAGE=extract sbatch --parsable --array=0-1 slurm/run.sbatch)
+MODELS="t5-small elf-xsum-inference" DATASETS=multidoc STAGE=select \
+  sbatch --dependency=afterok:$jid --array=0-7 slurm/run.sbatch
 
 # 3. monitor
 squeue --me
@@ -208,6 +276,8 @@ python -m tokid.extract --model elf --variant elf-b-de-en_t0.3_g2_scpred --datas
 python -m tokid.experiments --features features/elf-b_mrpc.pt --experiment identity --target token
 python -m tokid.experiments --features features/elf-b_mrpc.pt --experiment hidden2hidden
 python -m tokid.experiments --features features/elf-b_mrpc.pt --experiment neighbours
+python -m tokid.extract --model elf --elf-weights xsum --dataset multidoc   # all 7 elf-b-xsum_* points
+python -m tokid.selection --features features/elf-b-xsum_t0.3_multidoc.pt  # results/elf-b-xsum_t0.3_multidoc/selection.json
 python -m tokid.plots --results results/elf-b_mrpc --out figures/elf-b_mrpc
 python -m tokid.plots --pipeline results/t5-small_mrpc results/elf-b_mrpc --out figures/pipeline_mrpc
 ```
@@ -223,6 +293,12 @@ python -m tokid.plots --pipeline results/t5-small_mrpc results/elf-b_mrpc --out 
   `identity_token/fig2a_identifiability.png`, `fig2b_crosslayer_linear_cos.png`,
   `fig7_generalization_l2.png`, `fig8–10_*`, `hidden2hidden/fig11_*`,
   `neighbours_token/fig14–17_*` (PNG + PDF).
+* `multidoc`: `features/<tag>_multidoc.pt` (token ids, query positions, T5 embedding
+  matrix, sources, prompt lengths) + `<tag>_multidoc.hidden.npy` ((L+1)×queries×d,
+  float16); `results/<tag>_multidoc/selection.json` (splits, search pool, halving rounds,
+  CV, chosen configuration per layer, test rates with CIs);
+  `figures/<tag>_multidoc/selection/selection_layers.png`, `selection_by_source.png`,
+  `selection_by_length.png`, and the tables in `summary.md`.
 
 ## Layout
 
@@ -230,6 +306,7 @@ python -m tokid.plots --pipeline results/t5-small_mrpc results/elf-b_mrpc --out 
 tokid/data.py         GLUE dev sets and text formatting
 tokid/models.py       T5 / ELF-B hidden-state extractors
 tokid/extract.py      CLI: features
+tokid/selection.py    CLI: model selection of g_l with a locked test set (multidoc)
 tokid/splits.py       sentence-level 70/15/15 folds
 tokid/probes.py       batched linear/MLP probes, training with per-layer early stopping
 tokid/identify.py     within-sentence nearest-neighbour identification

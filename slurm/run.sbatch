@@ -9,6 +9,16 @@
 #   MODELS="t5-small elf-de-en-inference" DATASETS=wmt14 sbatch --array=0-7 slurm/run.sbatch
 #       translation ELF-B, prompt rows: 0=t5-small (pipeline baseline), 1=t=0 first step,
 #       2-6=denoiser t=0.1..0.9, 7=decoder t=1
+#   MODELS="t5-small elf-xsum-inference" DATASETS=docmix sbatch --array=0-7 slurm/run.sbatch
+#       summarization ELF-B, English prompts from 6 domains, real sampling trajectory:
+#       0=t5-small, 1=t=0, 2-6=t=0.1..0.9, 7=decoder; identity with 3 splits (sentence,
+#       leave-one-domain-out, unseen word types)
+#   Model selection of g_l (17 sources, locked test set), two steps; the ELF extraction
+#   writes all 7 trajectory points in one job, so it runs before the selection jobs:
+#     jid=$(MODELS="t5-small elf-b-xsum_t0" DATASETS=multidoc STAGE=extract sbatch --parsable --array=0-1 slurm/run.sbatch)
+#     MODELS="t5-small elf-xsum-inference" DATASETS=multidoc STAGE=select \
+#       sbatch --dependency=afterok:$jid --array=0-7 slurm/run.sbatch
+#       0=t5-small, 1=t=0, 2-6=t=0.1..0.9, 7=decoder
 #
 # AI-LAB allows at most 12 h per job. Shortly before the limit, the job requeues itself
 # (up to MAX_RESTARTS times). The experiments resume from their .partial checkpoints and
@@ -38,6 +48,7 @@ DATASETS=${DATASETS:-mrpc}
 export DEVICE=${DEVICE:-cuda}
 export FOLDS=${FOLDS:-10}
 export EXTRA=${EXTRA:-}
+export STAGE=${STAGE:-all} SEL_EXTRA=${SEL_EXTRA:-}   # multidoc (scripts/run_all.sh)
 MAX_RESTARTS=${MAX_RESTARTS:-6}
 
 # Everything was downloaded by slurm/setup.sh; never touch the network from compute nodes.
@@ -48,7 +59,7 @@ fi
 restarts=$(scontrol show job "$SLURM_JOB_ID" | grep -o 'Restarts=[0-9]*' | cut -d= -f2)
 restarts=${restarts:-0}
 echo "=== $(date) job $SLURM_JOB_ID on $(hostname), restart $restarts/$MAX_RESTARTS"
-echo "models=$MODELS datasets=$DATASETS folds=$FOLDS container=$CONTAINER"
+echo "models=$MODELS datasets=$DATASETS folds=$FOLDS stage=$STAGE container=$CONTAINER"
 
 term_handler() {
   echo "=== $(date) time limit approaching"

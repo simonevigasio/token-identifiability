@@ -19,6 +19,8 @@ ELF : tokens -> frozen T5-small encoder -> (h - mean)/std = z -> ELF-B.
 ELF De-En (conditional, ``ELFCondExtractor``): the sequence is [prompt | target | </s> pad]
       (128 rows), as in upstream conditional generation. Only the *prompt* rows are
       returned: ``tokens`` = T5 embeddings of the prompt ids, ``hidden[l]`` = prompt rows.
+ELF XSum (conditional, ``ELFTrajectoryExtractor``): prompt rows read during an actual
+      upstream sampling run from noise (no reference target needed).
 """
 
 from dataclasses import dataclass, asdict
@@ -40,7 +42,15 @@ ELF_WEIGHTS = {
     # train_de-en_ELF-B.yml, WMT14 German prompt -> English target (eval: cond_sampling_configs.yml)
     "de-en": dict(repo="embedded-language-flows/ELF-B-de-en-torch", revision="93ce98315a2dec985cdefb8d8e62ab618e896ec4",
                   filename="checkpoint_880600", max_length=128, max_input_length=64, conditional=True),
+    # train_xsum_ELF-B.yml, English article prompt -> one-sentence summary; probed on the
+    # real sampling trajectory (ELFTrajectoryExtractor), so any prompt works
+    "xsum": dict(repo="embedded-language-flows/ELF-B-xsum-torch", revision="aca4abd1c7ff5f841f0e2a3ec8a18b0a927927f1",
+                 filename="checkpoint_39800", max_length=1088, max_input_length=1024, conditional=True,
+                 trajectory=True),
 }
+# Flow times at which the trajectory extractor can read states. They are always inserted
+# into the sampling schedule, so every variant follows the very same trajectory.
+PROBE_TIMES = (0.1, 0.3, 0.5, 0.7, 0.9)
 ELF_REPO, ELF_REVISION, ELF_FILENAME = (ELF_WEIGHTS["owt"][k] for k in ("repo", "revision", "filename"))
 ELF_ENCODER = "google-t5/t5-small"
 T5_REVISIONS = {"google-t5/t5-small": "df1b051c49625cf57a3d0d8d3863ed4d13564fe4"}
@@ -145,14 +155,22 @@ def check_observation(obs: ELFObservation, conditional: bool):
         raise ValueError("guidance only acts on the self-conditioning x_pred of a conditional checkpoint")
 
 
-def capture_rows(elf, rows: slice) -> tuple[dict, list]:
-    """Hooks storing ``rows`` of the block-1 input (key 0) and of every block output (1..L)."""
-    captured = {}
-    hooks = [elf.blocks[0].register_forward_pre_hook(
-        lambda _m, args: captured.__setitem__(0, args[0][0, rows].clone()))]
+def capture_rows(elf, rows: slice, armed=None) -> tuple[dict, list]:
+    """Hooks storing ``rows`` of the block-1 input (key 0) and of every block output (1..L).
+
+    With ``armed`` (a one-element list), only the first forward pass after
+    ``armed[0] = True`` is stored; the hooks disarm themselves after the last block."""
+    captured, depth = {}, len(elf.blocks)
+
+    def store(l, x):
+        if armed is None or armed[0]:
+            captured[l] = x[0, rows].clone()
+            if armed is not None and l == depth:
+                armed[0] = False
+
+    hooks = [elf.blocks[0].register_forward_pre_hook(lambda _m, args: store(0, args[0]))]
     for l, block in enumerate(elf.blocks, start=1):
-        hooks.append(block.register_forward_hook(
-            lambda _m, _i, out, l=l: captured.__setitem__(l, out[0, rows].clone())))
+        hooks.append(block.register_forward_hook(lambda _m, _i, out, l=l: store(l, out)))
     return captured, hooks
 
 
@@ -297,6 +315,136 @@ class ELFCondExtractor:
         return {"tokens": tokens, "hidden": [captured[l] for l in range(len(self.elf.blocks) + 1)]}
 
 
+class ELFTrajectoryExtractor:
+    """Prompt rows of a conditional ELF read during a real upstream sampling run.
+
+    Exactly upstream conditional generation (generation.py: test_generation_cond with
+    cond_sampling_configs.yml), for one prompt:
+    * sequence of ``max_length`` rows: [prompt | </s> pad]; prompt latent = T5(prompt)
+      (prompt rows attend only to the prompt); the rest starts as 2 * N(0, 1) noise;
+    * schedule: ``num_steps`` sorted logit-normal(-1.5, 0.8) times with 0 / 1 endpoints,
+      plus PROBE_TIMES (and t) inserted, seeded per prompt;
+    * Euler ODE steps with upstream ``_ode_step``: CFG ``guidance`` on the prompt,
+      self-conditioning on the previous step's guided x-prediction (zeros, prompt
+      restored, at the first step), self-cond. CFG token ``cfg_scale``;
+    * final decoder step on [z, 0] at t = 1 (``_dlm_decode_batch``).
+    Denoiser mode reads the *conditional* ELF pass of the step that starts at ``t``
+    (t = 0 is the first step); decoder mode reads the final decoder step. No reference
+    target is used: the generated rows hold ELF's own partial output.
+    """
+
+    def __init__(self, encoder, elf, observation=ELFObservation(), max_length=1088, max_input_length=1024,
+                 pad_id=1, num_steps=64, guidance=2.0, p_mean=-1.5, p_std=0.8, t_eps=0.05,
+                 probe_times=PROBE_TIMES):
+        if observation.self_cond != "zero" or observation.guidance != 1.0:
+            raise ValueError("the trajectory sets self-conditioning and guidance itself (official sampler)")
+        if observation.mode == "decoder" and observation.t != 1.0:
+            raise ValueError("the decoder step runs at t = 1")
+        if not 0.0 <= observation.t <= 1.0:
+            raise ValueError("t must be in [0, 1]")
+        if observation.mode == "denoiser" and observation.t == 1.0:
+            raise ValueError("the denoiser is never evaluated at t = 1 in sampling")
+        if elf.max_length != max_length:
+            raise ValueError(f"ELF was built for {elf.max_length} rows, expected {max_length}")
+        self.encoder = encoder.eval().requires_grad_(False)
+        self.elf = elf.eval().requires_grad_(False)
+        self.obs = observation
+        self.max_length, self.max_input_length, self.pad_id = max_length, max_input_length, pad_id
+        self.num_steps, self.guidance, self.p_mean, self.p_std = num_steps, guidance, p_mean, p_std
+        self.probe_times = tuple(sorted({*probe_times, *([observation.t] if 0 < observation.t < 1 else [])}))
+        from types import SimpleNamespace
+        import importlib
+
+        self.sampling = importlib.import_module("utils.sampling_utils")  # upstream (import_elf put it on sys.path)
+        self.sampler_config = SimpleNamespace(t_eps=t_eps, self_cond_prob=0.5,
+                                              num_self_cond_cfg_tokens=elf.num_self_cond_cfg_tokens)
+
+    @property
+    def device(self):
+        return next(self.elf.parameters()).device
+
+    def schedule(self, gen: torch.Generator) -> torch.Tensor:
+        """get_sampling_steps("logit_normal") with a seeded generator, plus the probe times."""
+        steps = torch.sigmoid(torch.randn(self.num_steps - 1, generator=gen) * self.p_std + self.p_mean)
+        t = torch.cat([torch.zeros(1), steps, torch.ones(1), torch.tensor(self.probe_times)])
+        return torch.unique(t)  # sorted
+
+    def __call__(self, ids: torch.Tensor, index: int = 0, target_ids=None) -> dict:
+        point = "decoder" if self.obs.mode == "decoder" else f"t{self.obs.t:g}"
+        return self.run_points(ids, index, [point])[point]
+
+    @torch.no_grad()
+    def run_points(self, ids: torch.Tensor, index: int = 0, points=None) -> dict:
+        """One sampling run that reads several points of the trajectory at once.
+
+        points: labels "t<t>" (denoiser, the conditional pass of the step that starts at
+        t; t in {0} or the schedule's probe times) and "decoder"; default: all of them.
+        -> {label: {"tokens", "hidden"}}. Every point equals a separate run with that
+        observation, because the schedule, the noise and the steps do not depend on it."""
+        obs, dev, S = self.obs, self.device, self.max_length
+        points = list(points) if points is not None else self.all_points()
+        ids = ids.cpu()
+        n = ids.numel()
+        if n > self.max_input_length:
+            raise ValueError(f"prompt of {n} tokens exceeds max_input_length {self.max_input_length}")
+        seq = torch.cat([ids, torch.full((S - n,), self.pad_id, dtype=ids.dtype)])[None].to(dev)
+        is_cond = torch.arange(S, device=dev) < n
+        enc_mask = (is_cond[:, None] & is_cond[None, :]) | (~is_cond[:, None] & is_cond[None, :])
+        tokens = self.encoder.get_input_embeddings()(ids.to(dev))
+        x0 = self.encoder(input_ids=seq, attention_mask=enc_mask[None].float()).last_hidden_state
+        x0 = (x0 - obs.latent_mean) / obs.latent_std
+        m = is_cond[None].float()                               # cond_seq_mask (1, S)
+        cond_seq = x0 * m[..., None]
+
+        gen = torch.Generator(device="cpu").manual_seed(obs.noise_seed * 1_000_003 + index)
+        t_steps = self.schedule(gen).tolist()
+        steps = {}                                              # step index -> label
+        for p in points:
+            if p == "decoder":
+                continue
+            t = float(p[1:])
+            # the schedule is float32 (0.1 -> 0.10000000149), so match with a tolerance
+            hit = [i for i, s in enumerate(t_steps[:-1]) if abs(s - t) < 1e-6]
+            if not hit:
+                raise ValueError(f"{p}: t is not a step of the schedule (probe times {self.probe_times})")
+            steps[hit[0]] = p
+        decoder = "decoder" in points
+        last = len(t_steps) - 1 if decoder else max(steps) + 1
+        z = (torch.randn(x0.shape, generator=gen) * obs.noise_scale).to(dev)
+        restore = self.sampling.restore_cond
+        z = restore(z, cond_seq, m)
+        x_pred = restore(torch.zeros_like(z), cond_seq, m)
+
+        armed, out = [False], {}
+        captured, hooks = capture_rows(self.elf, slice(-S, -S + n), armed)
+
+        def collect(label):
+            out[label] = {"tokens": tokens, "hidden": [captured[l] for l in range(len(self.elf.blocks) + 1)]}
+            captured.clear()
+
+        try:
+            for i in range(last):
+                armed[0] = i in steps   # the first ELF call of a step is the conditional pass
+                z, x_pred = self.sampling._ode_step(
+                    model=self.elf, z=z, t=t_steps[i], t_next=t_steps[i + 1], x_pred_prev=x_pred,
+                    config=self.sampler_config, cfg_scale=self.guidance, self_cond_cfg_scale=obs.cfg_scale,
+                    cond_seq=cond_seq, cond_seq_mask=m)
+                if i in steps:
+                    collect(steps[i])
+            if decoder:  # utils/generation_utils._dlm_decode_batch
+                armed[0] = True
+                self.elf(torch.cat([z, torch.zeros_like(z)], -1), torch.ones(1, device=dev), deterministic=True,
+                         self_cond_cfg_scale=torch.full((1,), obs.cfg_scale, device=dev), decoder_step_active=True)
+                collect("decoder")
+        finally:
+            for h in hooks:
+                h.remove()
+        return out
+
+    def all_points(self):
+        return ["t0", *(f"t{t:g}" for t in self.probe_times), "decoder"]
+
+
 def load_elf(source=DEFAULT_ELF_SOURCE, observation=ELFObservation(), cache_dir=None,
              local_files_only=False, checkpoint=None, device="cpu", weights="owt"):
     from huggingface_hub import hf_hub_download
@@ -330,7 +478,15 @@ def load_elf(source=DEFAULT_ELF_SOURCE, observation=ELFObservation(), cache_dir=
         "encoder": ELF_ENCODER, "encoder_revision": encoder.config._commit_hash,
         "num_layers": len(elf.blocks), "d_model": elf.hidden_size, "observation": asdict(observation),
     }
-    if spec["conditional"]:
+    if spec.get("trajectory"):
+        extractor = ELFTrajectoryExtractor(encoder, elf, observation, spec["max_length"], spec["max_input_length"],
+                                           pad_id=tokenizer.eos_token_id)
+        meta.update(rows="prompt", max_length=spec["max_length"], max_input_length=spec["max_input_length"],
+                    trajectory=dict(sampler="ode", num_steps=extractor.num_steps, guidance=extractor.guidance,
+                                    self_cond_cfg=observation.cfg_scale, time_schedule="logit_normal",
+                                    p_mean=extractor.p_mean, p_std=extractor.p_std,
+                                    probe_times=list(extractor.probe_times), precision="fp32"))
+    elif spec["conditional"]:
         meta.update(rows="prompt", max_length=spec["max_length"], max_input_length=spec["max_input_length"])
         extractor = ELFCondExtractor(encoder, elf, observation, spec["max_length"], spec["max_input_length"],
                                      pad_id=tokenizer.eos_token_id)  # train_de-en_ELF-B.yml: pad_token eos

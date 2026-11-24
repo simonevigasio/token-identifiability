@@ -21,7 +21,14 @@ ELF_INFERENCE="elf-b_decoder_cfg3 elf-b_t0.1_cfg3_scpred elf-b_t0.3_cfg3_scpred 
 # the guided x-prediction as self-cond., final decoder step at t = 1. Run with DATASETS=wmt14.
 ELF_DEEN_INFERENCE="elf-b-de-en_t0 elf-b-de-en_t0.1_g2_scpred elf-b-de-en_t0.3_g2_scpred elf-b-de-en_t0.5_g2_scpred elf-b-de-en_t0.7_g2_scpred elf-b-de-en_t0.9_g2_scpred elf-b-de-en_decoder"
 
-# expand_models "list" -> the list with the keywords elf-inference / elf-de-en-inference replaced
+# "elf-xsum-inference": the XSum summarization checkpoint on English document prompts
+# (dataset docmix), states read on the *real* sampling trajectory (official sampler:
+# 64-step ODE, CFG 2, self-cond. CFG 1; the probe times are inserted into the schedule):
+# first step t = 0, the steps starting at t = 0.1 ... 0.9, final decoder step. Run with DATASETS=docmix.
+ELF_XSUM_INFERENCE="elf-b-xsum_t0 elf-b-xsum_t0.1 elf-b-xsum_t0.3 elf-b-xsum_t0.5 elf-b-xsum_t0.7 elf-b-xsum_t0.9 elf-b-xsum_decoder"
+
+# expand_models "list" -> the list with the keywords elf-inference / elf-de-en-inference /
+# elf-xsum-inference replaced
 expand_models() {
   local out=() m
   for m in $1; do
@@ -30,6 +37,9 @@ expand_models() {
       out+=("${extra[@]}")
     elif [ "$m" = elf-de-en-inference ]; then
       read -r -a extra <<< "$ELF_DEEN_INFERENCE"
+      out+=("${extra[@]}")
+    elif [ "$m" = elf-xsum-inference ]; then
+      read -r -a extra <<< "$ELF_XSUM_INFERENCE"
       out+=("${extra[@]}")
     else
       out+=("$m")
