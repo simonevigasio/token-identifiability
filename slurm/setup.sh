@@ -9,11 +9,11 @@
 # 1. venv on top of the AAU PyTorch container (torch/CUDA come from the container)
 # 2. pip install the remaining packages
 # 3. official ELF PyTorch code at the pinned commit -> .deps/elf-pytorch
-# 4. download T5-small, T5-base, ELF-B and GLUE into $HF_HOME
+# 4. download T5-small, T5-base, ELF-B (OWT + WMT14 De-En), GLUE and WMT14 into $HF_HOME
 # 5. unit tests + GPU check
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
-DATASETS=${DATASETS:-"mrpc cola mnli"}
+DATASETS=${DATASETS:-"mrpc cola mnli wmt14"}
 echo "container: $CONTAINER"
 echo "venv:      $VENV"
 echo "HF_HOME:   $HF_HOME"
@@ -31,7 +31,7 @@ if [ ! -d .deps/elf-pytorch ]; then
 fi
 
 # shellcheck disable=SC2086
-in_container python -m tokid.prefetch --models t5-small t5-base elf-b --datasets $DATASETS
+in_container python -m tokid.prefetch --models t5-small t5-base elf-b elf-b-de-en --datasets $DATASETS
 in_container python -m pytest -q
 in_container python -c "import torch, transformers; print('torch', torch.__version__, '| transformers', \
 transformers.__version__, '| CUDA available:', torch.cuda.is_available(), \

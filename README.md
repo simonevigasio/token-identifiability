@@ -9,6 +9,7 @@ Section 4 and Appendix B, with BERT replaced by:
 | `t5-small` | `google-t5/t5-small` encoder | 6 | 512 | ELF's frozen text encoder |
 | `t5-base`  | `google-t5/t5-base` encoder | 12 | 768 | same size as BERT-base in the paper |
 | `elf-b`    | ELF-B (OWT, 105M, `embedded-language-flows/ELF-B-owt-torch`) | 12 | 768 | tokens → T5-small → ELF-B |
+| `elf-b-de-en` | ELF-B (WMT14 De→En, 105M, `embedded-language-flows/ELF-B-de-en-torch`) | 12 | 768 | prompt rows of a conditional ELF |
 
 ## Method (as in the paper)
 
@@ -83,6 +84,35 @@ Section 4 and Appendix B, with BERT replaced by:
   (`scripts/models.sh`).
 * **Pipeline figure.** `figures/pipeline_<ds>/` puts T5-small blocks 1–6 and ELF-B
   in, 1–12 on one axis. It shows how token identity decays through ELF's whole stack.
+* **Conditional ELF: prompt rows** (`MODELS="t5-small elf-de-en-inference"`, dataset
+  `wmt14`). The OWT checkpoint is unconditional, so every row is generated. The
+  translation checkpoint (`ELF-B-de-en-torch`, German → English) works on a 128-row
+  sequence `[prompt (≤ 64) | target | </s> pad]` (`train_de-en_ELF-B.yml`). The prompt
+  rows are the clean T5 latent of the German sentence and are kept fixed during
+  sampling, while the target rows are generated. Here the queries and candidates are the
+  **prompt rows** only: `x_i` = T5 embedding of prompt token i, `e^l_i` = ELF state of
+  prompt row i. Everything follows upstream conditional generation
+  (`generation.py: test_generation_cond`, `cond_sampling_configs.yml`: 64-step ODE,
+  CFG 2, self-cond. CFG 1):
+  * T5 latent with the upstream masks: prompt rows attend only to the prompt (so they
+    equal T5 on the prompt alone); target/pad rows attend to every non-pad token.
+  * Target/pad rows: `z_t = t·x0 + (1−t)·2·ε` (seeded); prompt rows: clean `x0`.
+  * ELF gets no attention mask, as in sampling. The states are read from the
+    conditional pass.
+
+  | tag | step of inference | t | self-conditioning half |
+  |---|---|---|---|
+  | `elf-b-de-en_t0` | first step | 0 (target = pure noise) | zeros, prompt rows = clean prompt |
+  | `elf-b-de-en_t{0.1,0.3,0.5,0.7,0.9}_g2_scpred` | later denoiser steps | 0.1 … 0.9 | guided x̂ (CFG 2), prompt restored |
+  | `elf-b-de-en_decoder` | final decoder step | 1 (mode tokens on) | zeros |
+
+  x̂ is upstream `_forward_sample` at the same t (`x_uncond + 2·(x_cond − x_uncond)`),
+  i.e. what the next ODE step gets as `x_pred_prev`. The target rows hold the reference
+  translation (`x0`), noised to t. Data: the first 500 WMT14 validation pairs whose
+  prompt fits in 64 tokens (≈ 16.5k prompt tokens, mean length 33; `--max-examples`).
+  The prompt ids are the dataset's `condition_input_ids`, which equal T5's tokenization
+  with `</s>`. `t5-small` on `wmt14` encodes the same prompts and gives the pipeline
+  figure `figures/pipeline_de-en_<variant>_wmt14/`.
 
 Implementation notes:
 * The G layers of a model are trained together as G independent probes: parameters have a
@@ -103,7 +133,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install torch            # pick the CUDA build matching the machine
 pip install -e ".[test]"
 python scripts/prepare_elf.py   # clones github.com/lillian039/ELF @ b29d883 (pytorch_elf)
-python -m pytest -q             # 19 tests, CPU, no downloads needed
+python -m pytest -q             # CPU, no downloads needed
 ```
 
 ## Running on AAU AI-LAB / AI Cloud (Slurm + Singularity)
@@ -125,6 +155,8 @@ sbatch --array=0-2 slurm/run.sbatch
 DATASETS="mrpc cola mnli" sbatch --array=0-2 slurm/run.sbatch
 #    ELF as in standard inference (0=decoder t=1, 1-5=denoiser t=0.1..0.9):
 MODELS=elf-inference sbatch --array=0-5 slurm/run.sbatch
+#    translation ELF-B, prompt rows (0=t5-small, 1=t=0, 2-6=t=0.1..0.9 scpred, 7=decoder):
+MODELS="t5-small elf-de-en-inference" DATASETS=wmt14 sbatch --array=0-7 slurm/run.sbatch
 
 # 3. monitor
 squeue --me
@@ -147,8 +179,10 @@ tail -f logs/tokid_<jobid>_2.out
   `srun --mem=8G --cpus-per-task=2 --time=00:30:00 bash slurm/plots.sh`. Then copy them
   to your laptop: `rsync -av <user>@<front-end>:<repo>/figures ./`.
 
-The first run downloads T5-small/base, the ELF-B checkpoint (~0.8 GB) and GLUE from the
-Hugging Face Hub. Set `HF_HOME` or `HF_CACHE=...` to choose where they are stored.
+The first run downloads T5-small/base, the two ELF-B checkpoints (~0.8 GB each), GLUE and
+the WMT14 De-En validation set from the Hugging Face Hub. If setup already ran before the
+translation experiment existed, run `slurm/setup.sh` again (step 1). It is idempotent:
+it keeps the venv and ELF code and only downloads what is missing. Set `HF_HOME` or `HF_CACHE=...` to choose where they are stored.
 
 ## Run
 
@@ -159,8 +193,8 @@ bash scripts/run_all.sh                 # MRPC (main text)
 bash scripts/run_all.sh mrpc cola mnli  # + Appendix D
 ```
 
-Environment knobs: `MODELS="t5-small elf-b"` (or `elf-inference`, or any ELF tag such as
-`elf-b_t0.3_cfg3_scpred`), `FOLDS=10`, `DEVICE=cuda`, `EXTRA="--lr-search"`,
+Environment knobs: `MODELS="t5-small elf-b"` (or `elf-inference`, `elf-de-en-inference`
+with dataset `wmt14`, or any ELF tag such as `elf-b_t0.3_cfg3_scpred`), `FOLDS=10`, `DEVICE=cuda`, `EXTRA="--lr-search"`,
 `PY=python`. Finished steps are skipped, so after an interruption just re-run the same command.
 The `neighbours` experiment costs about 6× `identity`, since it trains one probe set per offset.
 
@@ -170,6 +204,7 @@ Single steps:
 python -m tokid.extract --model elf --dataset mrpc                               # features/elf-b_mrpc.pt
 python -m tokid.extract --model t5 --t5-name google-t5/t5-small --dataset mrpc   # features/t5-small_mrpc.pt
 python -m tokid.extract --model elf --variant elf-b_decoder_cfg3 --dataset mrpc  # features/elf-b_decoder_cfg3_mrpc.pt
+python -m tokid.extract --model elf --variant elf-b-de-en_t0.3_g2_scpred --dataset wmt14  # prompt rows
 python -m tokid.experiments --features features/elf-b_mrpc.pt --experiment identity --target token
 python -m tokid.experiments --features features/elf-b_mrpc.pt --experiment hidden2hidden
 python -m tokid.experiments --features features/elf-b_mrpc.pt --experiment neighbours

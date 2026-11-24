@@ -6,6 +6,9 @@
 #   MODELS="elf-b" sbatch --array=0 slurm/run.sbatch                # a single model
 #   MODELS="elf-inference" sbatch --array=0-5 slurm/run.sbatch      # ELF as in standard inference:
 #       0=decoder t=1, 1-5=denoiser t=0.1,0.3,0.5,0.7,0.9 (see scripts/models.sh)
+#   MODELS="t5-small elf-de-en-inference" DATASETS=wmt14 sbatch --array=0-7 slurm/run.sbatch
+#       translation ELF-B, prompt rows: 0=t5-small (pipeline baseline), 1=t=0 first step,
+#       2-6=denoiser t=0.1..0.9, 7=decoder t=1
 #
 # AI-LAB allows at most 12 h per job. Shortly before the limit, the job requeues itself
 # (up to MAX_RESTARTS times). The experiments resume from their .partial checkpoints and

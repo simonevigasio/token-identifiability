@@ -125,3 +125,116 @@ def test_elf_self_cond_pred_rejected_for_decoder(tiny_elf):
     _, elf = tiny_elf
     with pytest.raises(ValueError):
         ELFExtractor(tiny_t5(), elf, ELFObservation(mode="decoder", self_cond="pred"))
+
+
+# ------------------------------------------------- conditional (translation) ELF
+
+@pytest.fixture(scope="module")
+def tiny_cond_elf():
+    if not elf_available:
+        pytest.skip("ELF source not prepared (python scripts/prepare_elf.py)")
+    from tokid.models import import_elf
+
+    module = import_elf(DEFAULT_ELF_SOURCE)
+    torch.manual_seed(1)
+    return module.ELF(text_encoder_dim=32, max_length=16, hidden_size=48, depth=3, num_heads=4,
+                      bottleneck_dim=8, num_time_tokens=4, num_self_cond_cfg_tokens=4,
+                      num_model_mode_tokens=4, vocab_size=100).eval()
+
+
+PROMPT, TARGET = torch.tensor([5, 7, 9, 5, 1]), torch.tensor([11, 12, 13, 1])
+
+
+def cond_extractor(elf, enc, **obs):
+    from tokid.models import ELFCondExtractor
+
+    return ELFCondExtractor(enc, elf, ELFObservation(**obs), max_length=16, max_input_length=8, pad_id=1)
+
+
+def cond_inputs(ext, obs, index=0):
+    """Upstream-style latent: x0 from the conditional encoder masks, prompt kept clean."""
+    seq, enc_mask, m = ext.sequence(PROMPT, TARGET)
+    x0 = ext.encoder(input_ids=seq, attention_mask=enc_mask).last_hidden_state / obs.latent_std
+    gen = torch.Generator().manual_seed(obs.noise_seed * 1_000_003 + index)
+    z = obs.t * x0 + (1 - obs.t) * torch.randn(x0.shape, generator=gen) * obs.noise_scale
+    return x0, torch.where(m > 0, x0, z), m
+
+
+def test_cond_sequence_matches_upstream_collate(tiny_cond_elf):
+    from utils.encoder_utils import build_self_attn_cond_masks  # upstream
+    import numpy as np
+
+    ext = cond_extractor(tiny_cond_elf, tiny_t5())
+    seq, enc_mask, m = ext.sequence(PROMPT, TARGET)
+    assert seq[0].tolist() == [5, 7, 9, 5, 1, 11, 12, 13, 1] + [1] * 7
+    pos = np.arange(16)[None]
+    ref, _, cond = build_self_attn_cond_masks(pos < 5, pos < 9, xp=np)
+    torch.testing.assert_close(enc_mask, torch.from_numpy(ref))
+    torch.testing.assert_close(m[..., 0], torch.from_numpy(cond))
+    with torch.no_grad():  # prompt rows of the latent = T5 on the prompt alone
+        x = ext.encoder(input_ids=seq, attention_mask=enc_mask).last_hidden_state[0, :5]
+        torch.testing.assert_close(x, ext.encoder(input_ids=PROMPT[None]).last_hidden_state[0])
+    with pytest.raises(ValueError):
+        ext.sequence(torch.arange(9), TARGET)  # prompt longer than max_input_length
+
+
+def test_cond_first_step_t0_zero_self_cond(tiny_cond_elf):
+    """t = 0, zero self-cond. = upstream's first sampling step: pure noise + clean prompt."""
+    enc = tiny_t5()
+    ext = cond_extractor(tiny_cond_elf, enc, t=0.0, noise_seed=2)
+    out = ext(PROMPT, index=3, target_ids=TARGET)
+    assert len(out["hidden"]) == 4 and all(h.shape == (5, 48) for h in out["hidden"])
+    torch.testing.assert_close(out["tokens"], enc.get_input_embeddings()(PROMPT))
+    with torch.no_grad():
+        x0, z, m = cond_inputs(ext, ext.obs, index=3)
+        sc = m * x0  # generation_utils: x_pred = restore_cond(zeros, cond_seq, cond_seq_mask)
+        inp = torch.cat([z, sc], -1)
+        torch.testing.assert_close(out["hidden"][0], tiny_cond_elf.text_proj(tiny_cond_elf.self_cond_proj(inp))[0, :5])
+        ref, _ = tiny_cond_elf(inp, torch.zeros(1), self_cond_cfg_scale=torch.ones(1))
+        torch.testing.assert_close(tiny_cond_elf.final_layer(out["hidden"][-1][None]), ref[:, :5])
+
+
+def test_cond_self_cond_pred_matches_upstream_ode_step(tiny_cond_elf):
+    """scpred + guidance 2: self-cond. = x_pred of upstream _ode_step (CFG 2, SC-CFG 1)."""
+    from types import SimpleNamespace
+    import importlib
+
+    su = importlib.import_module("utils.sampling_utils")
+    ext = cond_extractor(tiny_cond_elf, tiny_t5(), t=0.3, self_cond="pred", guidance=2.0, noise_seed=1)
+    out = ext(PROMPT, index=0, target_ids=TARGET)
+    cfg = SimpleNamespace(t_eps=0.05, self_cond_prob=0.5, num_self_cond_cfg_tokens=4)
+    with torch.no_grad():
+        x0, z, m = cond_inputs(ext, ext.obs)
+        _, x_pred = su._ode_step(model=tiny_cond_elf, z=z, t=0.3, t_next=0.4, x_pred_prev=m * x0, config=cfg,
+                                 cfg_scale=2.0, self_cond_cfg_scale=1.0, cond_seq=x0, cond_seq_mask=m[..., 0])
+        torch.testing.assert_close(x_pred[:, :5], x0[:, :5])  # prompt restored
+        inp = torch.cat([z, x_pred], -1)
+        torch.testing.assert_close(out["hidden"][0], tiny_cond_elf.text_proj(tiny_cond_elf.self_cond_proj(inp))[0, :5])
+        ref, _ = tiny_cond_elf(inp, torch.full((1,), 0.3), self_cond_cfg_scale=torch.ones(1))
+        torch.testing.assert_close(tiny_cond_elf.final_layer(out["hidden"][-1][None]), ref[:, :5])
+
+
+def test_cond_decoder_matches_upstream_decode(tiny_cond_elf):
+    from types import SimpleNamespace
+    import importlib
+
+    gu = importlib.import_module("utils.generation_utils")
+    ext = cond_extractor(tiny_cond_elf, tiny_t5(), mode="decoder")
+    out = ext(PROMPT, target_ids=TARGET)
+    with torch.no_grad():
+        x0, _, _ = cond_inputs(ext, ext.obs)
+        cfg = SimpleNamespace(num_self_cond_cfg_tokens=4, self_cond_prob=0.5, use_bf16=False)
+        ids = gu._dlm_decode_batch(x0, tiny_cond_elf, 1.0, cfg, 1.0)
+        h = out["hidden"][-1][None]
+        logits = (F.gelu(h @ tiny_cond_elf.proj_kernel + tiny_cond_elf.proj_bias, approximate="tanh")
+                  @ tiny_cond_elf.unembed_kernel + tiny_cond_elf.unembed_bias)
+        assert torch.equal(logits.argmax(-1), ids[:, :5])
+
+
+@pytest.mark.parametrize("obs", [dict(guidance=2.0), dict(guidance=2.0, self_cond="pred", conditional=False)])
+def test_guidance_needs_conditional_self_cond_pred(obs):
+    from tokid.models import check_observation
+
+    conditional = obs.pop("conditional", True)
+    with pytest.raises(ValueError):
+        check_observation(ELFObservation(**obs), conditional)

@@ -9,6 +9,8 @@
 #   MODELS="t5-small t5-base elf-b"  FOLDS=10  DEVICE=auto  PY=python
 #   MODELS="elf-inference"    (ELF as in standard inference: decoder t=1 + denoiser t<1,
 #                              see scripts/models.sh; can be mixed with other models)
+#   MODELS="t5-small elf-de-en-inference" bash scripts/run_all.sh wmt14
+#                             (translation ELF-B, prompt rows, whole inference cycle)
 #   EXTRA="--lr-search"   (extra flags for every experiment)
 #   HF_CACHE=/path        (HuggingFace cache dir; default: HF default)
 # Finished steps are skipped, so the script can simply be re-run after an interruption.
@@ -42,8 +44,7 @@ for ds in "${DATASETS[@]}"; do
     feats=features/${model}_${ds}.pt
     if [ ! -f "$feats" ]; then
       case $model in
-        elf-b) $PY -m tokid.extract --model elf --dataset "$ds" --device "$DEVICE" ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} --out "$feats" ;;
-        elf-b_*) $PY -m tokid.extract --model elf --variant "$model" --dataset "$ds" --device "$DEVICE" \
+        elf-b*) $PY -m tokid.extract --model elf --variant "$model" --dataset "$ds" --device "$DEVICE" \
                    ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} --out "$feats" ;;
         t5-*)  $PY -m tokid.extract --model t5 --t5-name "google-t5/$model" --dataset "$ds" --device "$DEVICE" \
                    ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} --out "$feats" ;;
@@ -63,7 +64,7 @@ for ds in "${DATASETS[@]}"; do
   # Whenever both exist (also when each model ran in its own Slurm array task).
   for model in $MODELS; do
     [[ $model == elf-b* ]] || continue
-    name=${model#elf-b}   # "" for elf-b, else e.g. "_decoder_cfg3"
+    name=${model#elf-b}; name=${name/#-/_}   # "" for elf-b, else e.g. "_decoder_cfg3", "_de-en_t0"
     if [ -f "results/t5-small_${ds}/identity_token.json" ] && [ -f "results/${model}_${ds}/identity_token.json" ]; then
       $PY -m tokid.plots --pipeline "results/t5-small_${ds}" "results/${model}_${ds}" --out "figures/pipeline${name}_${ds}"
     fi

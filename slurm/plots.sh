@@ -5,7 +5,8 @@
 #
 # results/<model>_<dataset>/      -> figures/<model>_<dataset>/ (PNG + PDF + summary.md)
 # t5-small + elf-b of a dataset   -> figures/pipeline_<dataset>/
-# t5-small + an ELF variant       -> figures/pipeline_<variant>_<dataset>/ (e.g. pipeline_decoder_cfg3_mrpc)
+# t5-small + an ELF variant       -> figures/pipeline_<variant>_<dataset>/ (e.g. pipeline_decoder_cfg3_mrpc,
+#                                    pipeline_de-en_t0.3_g2_scpred_wmt14)
 # Unfinished experiments (only a .partial checkpoint, no .json yet) are skipped.
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
@@ -29,7 +30,7 @@ for t5 in results/t5-small_*/; do
   for elf in results/elf-b*_"$ds"/; do
     elf=${elf%/}
     [ -f "$elf/identity_token.json" ] || continue
-    name=$(basename "$elf"); name=${name#elf-b}; name=${name%_"$ds"}   # "" or e.g. "_decoder_cfg3"
+    name=$(basename "$elf"); name=${name#elf-b}; name=${name%_"$ds"}; name=${name/#-/_}   # "", "_decoder_cfg3", "_de-en_t0"
     in_container python -m tokid.plots --pipeline "results/t5-small_$ds" "$elf" \
       --out "figures/pipeline${name}_$ds"
   done
