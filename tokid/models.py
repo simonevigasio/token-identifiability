@@ -155,6 +155,29 @@ def check_observation(obs: ELFObservation, conditional: bool):
         raise ValueError("guidance only acts on the self-conditioning x_pred of a conditional checkpoint")
 
 
+def encode_masked(encoder, input_ids, mask):
+    """T5 encoder output with a per-row attention mask ``mask`` (B, S, S), 1 = may attend.
+
+    transformers >= 4.48 only accepts 2D (padding) masks for the T5 encoder; older
+    versions turned a 3D mask into the additive (1 - m) * finfo.min and added it to the
+    relative-position bias of the first self-attention layer, which every later layer
+    reuses. This does exactly that, through a hook on that layer, so the result is the
+    same with every transformers version."""
+    dtype = next(encoder.parameters()).dtype
+    additive = (1.0 - mask[:, None].to(dtype)) * torch.finfo(dtype).min      # (B, 1, S, S)
+    attn = encoder.encoder.block[0].layer[0].SelfAttention
+
+    def inject(_module, args, kwargs):
+        kwargs["mask"] = additive.to(args[0].device)
+        return args, kwargs
+
+    hook = attn.register_forward_pre_hook(inject, with_kwargs=True)
+    try:
+        return encoder(input_ids=input_ids).last_hidden_state
+    finally:
+        hook.remove()
+
+
 def capture_rows(elf, rows: slice, armed=None) -> tuple[dict, list]:
     """Hooks storing ``rows`` of the block-1 input (key 0) and of every block output (1..L).
 
@@ -285,7 +308,7 @@ class ELFCondExtractor:
         n = ids.numel()
         seq, enc_mask, m = (x.to(dev) for x in self.sequence(ids, torch.as_tensor(target_ids, dtype=ids.dtype)))
         tokens = self.encoder.get_input_embeddings()(ids.to(dev))
-        x0 = self.encoder(input_ids=seq, attention_mask=enc_mask).last_hidden_state
+        x0 = encode_masked(self.encoder, seq, enc_mask)
         x0 = (x0 - obs.latent_mean) / obs.latent_std
         t = torch.full((1,), obs.t, device=dev)
         cfg = torch.full((1,), obs.cfg_scale, device=dev)
@@ -391,7 +414,7 @@ class ELFTrajectoryExtractor:
         is_cond = torch.arange(S, device=dev) < n
         enc_mask = (is_cond[:, None] & is_cond[None, :]) | (~is_cond[:, None] & is_cond[None, :])
         tokens = self.encoder.get_input_embeddings()(ids.to(dev))
-        x0 = self.encoder(input_ids=seq, attention_mask=enc_mask[None].float()).last_hidden_state
+        x0 = encode_masked(self.encoder, seq, enc_mask[None].float())
         x0 = (x0 - obs.latent_mean) / obs.latent_std
         m = is_cond[None].float()                               # cond_seq_mask (1, S)
         cond_seq = x0 * m[..., None]

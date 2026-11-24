@@ -5,7 +5,8 @@ import torch
 import torch.nn.functional as F
 from transformers import T5Config, T5EncoderModel
 
-from tokid.models import DEFAULT_ELF_SOURCE, ELFExtractor, ELFObservation, T5Extractor, VariableLengthRoPE
+from tokid.models import (DEFAULT_ELF_SOURCE, ELFExtractor, ELFObservation, T5Extractor, VariableLengthRoPE,
+                          encode_masked)
 
 
 def tiny_t5(d_model=32):
@@ -154,7 +155,7 @@ def cond_extractor(elf, enc, **obs):
 def cond_inputs(ext, obs, index=0):
     """Upstream-style latent: x0 from the conditional encoder masks, prompt kept clean."""
     seq, enc_mask, m = ext.sequence(PROMPT, TARGET)
-    x0 = ext.encoder(input_ids=seq, attention_mask=enc_mask).last_hidden_state / obs.latent_std
+    x0 = encode_masked(ext.encoder, seq, enc_mask) / obs.latent_std
     gen = torch.Generator().manual_seed(obs.noise_seed * 1_000_003 + index)
     z = obs.t * x0 + (1 - obs.t) * torch.randn(x0.shape, generator=gen) * obs.noise_scale
     return x0, torch.where(m > 0, x0, z), m
@@ -172,7 +173,7 @@ def test_cond_sequence_matches_upstream_collate(tiny_cond_elf):
     torch.testing.assert_close(enc_mask, torch.from_numpy(ref))
     torch.testing.assert_close(m[..., 0], torch.from_numpy(cond))
     with torch.no_grad():  # prompt rows of the latent = T5 on the prompt alone
-        x = ext.encoder(input_ids=seq, attention_mask=enc_mask).last_hidden_state[0, :5]
+        x = encode_masked(ext.encoder, seq, enc_mask)[0, :5]
         torch.testing.assert_close(x, ext.encoder(input_ids=PROMPT[None]).last_hidden_state[0])
     with pytest.raises(ValueError):
         ext.sequence(torch.arange(9), TARGET)  # prompt longer than max_input_length
@@ -238,3 +239,25 @@ def test_guidance_needs_conditional_self_cond_pred(obs):
     conditional = obs.pop("conditional", True)
     with pytest.raises(ValueError):
         check_observation(ELFObservation(**obs), conditional)
+
+
+def test_encode_masked_matches_padding_and_3d_masks():
+    enc = tiny_t5()
+    ids = torch.tensor([[5, 7, 9, 5, 1, 1, 1, 1]])
+    valid = torch.tensor([[1, 1, 1, 1, 1, 0, 0, 0]])
+    # every row sees the same columns -> identical to the 2D padding mask (any transformers version)
+    rows = valid[:, None, :].expand(1, 8, 8).float()
+    native_2d = enc(input_ids=ids, attention_mask=valid).last_hidden_state
+    torch.testing.assert_close(encode_masked(enc, ids, rows), native_2d, rtol=0, atol=0)
+    # a per-row mask (prompt rows see only the prompt): older transformers take it natively
+    is_cond = torch.arange(8) < 3
+    m = ((is_cond[:, None] & is_cond[None, :]) | (~is_cond[:, None] & valid[0].bool()[None, :]))[None].float()
+    try:
+        native_3d = enc(input_ids=ids, attention_mask=m).last_hidden_state
+    except RuntimeError:  # transformers >= 4.48: 2D masks only
+        native_3d = None
+    out = encode_masked(enc, ids, m)
+    if native_3d is not None:
+        torch.testing.assert_close(out, native_3d, rtol=0, atol=0)
+    # prompt rows depend only on the prompt
+    torch.testing.assert_close(out[0, :3], enc(input_ids=ids[:, :3]).last_hidden_state[0], rtol=1e-5, atol=1e-5)
