@@ -10,7 +10,7 @@ import argparse
 from pathlib import Path
 
 from tokid.data import DATASET_NAMES, load_texts
-from tokid.models import DEFAULT_ELF_SOURCE, load_elf, load_t5
+from tokid.models import DEFAULT_ELF_SOURCE, ELF_WEIGHTS, ELFObservation, load_elf, load_t5
 
 
 def main(argv=None):
@@ -28,7 +28,10 @@ def main(argv=None):
     for model in args.models:
         if model.startswith("elf-b"):
             weights = "owt" if model == "elf-b" else model.removeprefix("elf-b-")
-            _, _, meta = load_elf(args.elf_source, cache_dir=args.cache_dir, weights=weights)
+            # The XSum loader only accepts observations that occur in sampling (not the
+            # denoiser at t = 1); the decoder step is one of them. Only downloads matter here.
+            obs = ELFObservation(mode="decoder") if ELF_WEIGHTS[weights].get("trajectory") else ELFObservation()
+            _, _, meta = load_elf(args.elf_source, obs, cache_dir=args.cache_dir, weights=weights)
             print(f"[prefetch] {meta['model']} checkpoint step {meta['checkpoint_step']} + {meta['encoder']}")
         else:
             _, _, meta = load_t5(f"google-t5/{model}", cache_dir=args.cache_dir)
