@@ -24,6 +24,8 @@
 #   STAGE=extract|select|all  (multidoc only; default all. The ELF extraction writes all 7
 #                              trajectory points at once, so on Slurm run STAGE=extract first,
 #                              then the selection jobs; see slurm/run.sbatch)
+#   STAGE=retest              (multidoc only: re-test finished selections with the current test
+#                              metrics, e.g. vocabulary-wide identifiability; no new search)
 #   SEL_EXTRA="--n-random 64" (extra flags for tokid.selection)
 #   EXTRA="--lr-search"   (extra flags for every experiment)
 #   HF_CACHE=/path        (HuggingFace cache dir; default: HF default)
@@ -66,7 +68,11 @@ run_shared() {  # elf-b-xsum_share-<time|layer|both>: one probe shared across po
     fi
     feats+=("features/${p}_multidoc.pt")
   done
-  if [ -f "$res/selection.json" ]; then
+  if [ "$STAGE" = retest ]; then
+    if [ ! -f "$res/selection.json" ]; then echo "missing $res/selection.json: nothing to re-test"; exit 1; fi
+    $PY -m tokid.selection --features "${feats[@]}" --share "$mode" --tag "$model" --device "$DEVICE" \
+        --out "$res/selection.json" --retest $SEL_EXTRA
+  elif [ -f "$res/selection.json" ]; then
     echo "skip $res/selection.json"
   else
     $PY -m tokid.selection --features "${feats[@]}" --share "$mode" --tag "$model" --device "$DEVICE" \
@@ -81,6 +87,12 @@ run_multidoc() {  # model: extraction (all ELF points at once) and/or model sele
   local model=$1 feats=features/${1}_multidoc.pt res=results/${1}_multidoc done=features/${1}_multidoc.pt
   # The ELF extraction writes all 7 points and finishes with the decoder one.
   [[ $model == elf-b-xsum* ]] && done=features/elf-b-xsum_decoder_multidoc.pt
+  if [ "$STAGE" = retest ]; then
+    if [ ! -f "$res/selection.json" ]; then echo "missing $res/selection.json: nothing to re-test"; exit 1; fi
+    $PY -m tokid.selection --features "$feats" --device "$DEVICE" --out "$res/selection.json" --retest $SEL_EXTRA
+    $PY -m tokid.plots --results "$res" --out "figures/${model}_multidoc"
+    return
+  fi
   if [ "$STAGE" != select ] && [ ! -f "$done" ]; then
     case $model in
       elf-b-xsum*) $PY -m tokid.extract --model elf --elf-weights xsum --dataset multidoc --device "$DEVICE" \

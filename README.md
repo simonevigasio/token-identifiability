@@ -177,6 +177,28 @@ score would overstate that bound, so no test document is ever used for a decisio
   many `<unk>` tokens. All of them share one embedding, so retrieving any `<unk>` counts
   as correct (same rule as for repeated words).
 
+### Vocabulary-wide identifiability (`multidoc`, test only)
+
+The paper's test, used everywhere above, compares a token only with the **other distinct
+tokens of its own prompt** (a few dozen to a few hundred candidates). The selection runs also
+report a harder test: the probe output is compared with **every row of the T5 embedding
+matrix** (the whole vocabulary, ~32k tokens; T5's 28 unused padding rows included), and the
+token counts as identified if it is the nearest (`vocab_top1`) or among the 5 nearest
+(`vocab_top5`); also for unseen token types (`vocab_top1_unseen`). Same probes, same metric
+(cos / L2), same test documents and paired bootstrap resamples as the same-prompt rate.
+Training and selection are unchanged (same-prompt), so this only re-scores the chosen probes.
+Top-1 over the vocabulary can never exceed the same-prompt rate.
+
+* New runs compute it automatically. Runs finished before it existed are re-tested with
+  `--retest` (`STAGE=retest` in `scripts/run_all.sh`): the halving and CV results are read
+  from the finished `selection.json`, only the chosen and paper probes are retrained, with the
+  same seeds, and tested both ways. The same-prompt rates reproduce the original run (exactly
+  on CPU; the run logs the largest difference); the old file is kept as
+  `selection.prompt-only.json`. Cost: the refit and paper stages only, a few hours per run.
+* Output: `vocab_top1`, `vocab_top5`, `vocab_top1_unseen` next to `all` in
+  `selection.json`; rows "whole vocabulary" in `summary.md`; figure `selection_vocab`
+  (per-point runs) and the vocabulary grids, shared vs dedicated, in the shared runs' summary.
+
 ### Shared probes: is g time- or layer-independent? (`multidoc`, `--share`)
 
 The selection above trains a separate g for every (trajectory point, layer) pair. Here one g
@@ -273,6 +295,8 @@ MODELS="t5-small elf-xsum-inference" DATASETS=multidoc STAGE=select \
 #    shared probes (0=time-independent, 1=layer-independent), after the extraction; up to
 #    ~7x / ~13x a per-point selection, hence many restarts;
 #    2 GPUs because the hidden states of all 7 points (~26 GiB) are spread over them:
+#    vocabulary-wide test of finished selections (no new search; 0=t5-small, 1-7=ELF points):
+MODELS="t5-small elf-xsum-inference" DATASETS=multidoc STAGE=retest sbatch --array=0-7 slurm/run.sbatch
 MAX_RESTARTS=30 MODELS=elf-xsum-shared DATASETS=multidoc STAGE=select \
   sbatch --gres=gpu:2 --mem=48G --array=0-1 slurm/run.sbatch
 #    ... or on AI Cloud, 6-day jobs on the prioritized partition (far fewer restarts); not on

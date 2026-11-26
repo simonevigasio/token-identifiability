@@ -21,6 +21,10 @@ keeps every test document out of every decision:
    ``--seeds`` seeds, and evaluated on test_id and test_ood. Rates come with 95%
    bootstrap confidence intervals over test documents, and are broken down by source,
    by prompt length, and by whether the token type occurred as a training target.
+   Besides the paper's test (nearest among the prompt's own distinct tokens), every
+   test is also scored against the whole vocabulary (every row of the embedding
+   matrix): true token nearest (vocab_top1) or among the 5 nearest (vocab_top5).
+   ``--retest`` adds these to a finished run without redoing the search.
 
 The paper's probes (linear / MLP-1000, cosine / L2, lr 1e-4, early stopping on the
 validation loss with patience 20) are trained on the same dev split and tested on the
@@ -54,6 +58,7 @@ Example:
 """
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -94,6 +99,7 @@ def load_query_features(path, device):
 # one point of the ELF sampling trajectory (t0, t0.1, ..., decoder). Cell index:
 # variant * layers + layer. Every probe reads the cells of one row of ``probe_cells``.
 SHARE_MODES = ("none", "time", "layer", "both")
+VOCAB_KS = (1, 5)   # vocabulary-wide identifiability: true token among the k nearest of all tokens
 
 
 def probe_cells(share: str, variants: int, layers: int) -> torch.Tensor:
@@ -313,6 +319,40 @@ class QueryData:
                 ok[self.cells[:, k]] = self.c_tok[c][score.argmax(-1)] == self.q_tok[idx]
             out.append(ok)
         return torch.cat(out, dim=1)
+
+    @torch.no_grad()
+    def vocab_correct(self, model, docs, metric, ks=VOCAB_KS, chunk=None):
+        """Vocabulary-wide identifiability: dict k -> bool (C, queries of ``docs`` in order),
+        per cell: the true token is among the k nearest rows of the whole embedding matrix
+        (every token of the vocabulary, not only the prompt's). Same probe outputs and
+        metric as ``correct``; the scores are computed in full float32 (no TF32), since
+        neighbours among ~32k rows can be close."""
+        idx = self.queries(docs)
+        V = self.E.shape[0]
+        chunk = chunk or max(64, (1 << 28) // (self.probes * V))   # score block of ~1 GiB
+        E, En, e2 = self.E, self.En, (self.E * self.E).sum(-1)
+        out = {k: torch.empty(self.num_cells, idx.numel(), dtype=torch.bool, device=self.device) for k in ks}
+        kmax = max(ks)
+        for i in range(0, idx.numel(), chunk):
+            b = idx[i:i + chunk]
+            true = self.q_tok[b][None, :, None]
+            for k in range(self.share_k):
+                pred = model(self.inputs(k, b))                          # (P, n, d_tok)
+                tf32 = torch.backends.cuda.matmul.allow_tf32
+                torch.backends.cuda.matmul.allow_tf32 = False
+                try:
+                    if metric == "cos":
+                        score = F.normalize(pred, dim=-1) @ En.T
+                    elif metric == "l2":
+                        score = 2 * pred @ E.T - e2                      # -|p - e|^2 + |p|^2: same order
+                    else:
+                        raise ValueError(metric)
+                finally:
+                    torch.backends.cuda.matmul.allow_tf32 = tf32
+                hit = score.topk(kmax, dim=-1).indices == true           # (P, n, kmax)
+                for kk in ks:
+                    out[kk][self.cells[:, k], i:i + b.numel()] = hit[..., :kk].any(-1)
+        return out
 
     @torch.no_grad()
     def mean_loss(self, model, idx, cfg, chunk: int = 4096):
@@ -566,6 +606,7 @@ def doc_counts(data, model, docs, metric, seen_types):
     """Per test document and layer: correct queries, all and those whose token type
     never occurred as a training target ("unseen")."""
     ok = data.correct(model, docs, metric)                         # (G, n)
+    vocab = data.vocab_correct(model, docs, metric)                # k -> (G, n)
     idx = data.queries(docs)
     q_doc = data.q_doc[idx]
     unseen = ~torch.isin(data.q_tok[idx], seen_types)
@@ -573,15 +614,19 @@ def doc_counts(data, model, docs, metric, seen_types):
     col = torch.tensor([pos[int(d)] for d in q_doc.tolist()], device=data.device)
     D, G = len(docs), data.num_cells
 
-    def per_doc(mask):
-        c = torch.zeros(G, D, device=data.device).index_add_(1, col[mask], ok[:, mask].float())
+    def per_doc(mask, hits):
+        c = torch.zeros(G, D, device=data.device).index_add_(1, col[mask], hits[:, mask].float())
         n = torch.zeros(D, device=data.device).index_add_(0, col[mask], torch.ones(int(mask.sum()), device=data.device))
         return c.tolist(), n.tolist()
 
     all_mask = torch.ones_like(unseen)
-    c, n = per_doc(all_mask)
-    cu, nu = per_doc(unseen)
-    return {"correct": c, "n": n, "correct_unseen": cu, "n_unseen": nu}
+    c, n = per_doc(all_mask, ok)
+    cu, nu = per_doc(unseen, ok)
+    out = {"correct": c, "n": n, "correct_unseen": cu, "n_unseen": nu}
+    for k, hits in vocab.items():
+        out[f"correct_v{k}"] = per_doc(all_mask, hits)[0]
+        out[f"correct_unseen_v{k}"] = per_doc(unseen, hits)[0]
+    return out
 
 
 def bootstrap(correct, n, groups, rng, reps: int):
@@ -608,11 +653,19 @@ def bootstrap(correct, n, groups, rng, reps: int):
 def summarize(counts, data, docs, rng, reps):
     doms = [data.domains[d] for d in docs]
     lens = [data.doc_lengths[d] for d in docs]
+    start = copy.deepcopy(rng)   # the vocabulary-wide CIs reuse the document resamples of "all" (paired)
     by_dom = bootstrap(counts["correct"], counts["n"], doms, rng, reps)
     by_len = bootstrap(counts["correct"], counts["n"], lens, rng, reps)
     unseen = bootstrap(counts["correct_unseen"], counts["n_unseen"], doms, rng, reps)
-    return {"all": by_dom["all"], "by_source": by_dom["by_group"], "by_length": by_len["by_group"],
-            "unseen_types": unseen["all"]}
+    out = {"all": by_dom["all"], "by_source": by_dom["by_group"], "by_length": by_len["by_group"],
+           "unseen_types": unseen["all"]}
+    for k in VOCAB_KS:
+        if f"correct_v{k}" in counts:   # absent in units computed before vocabulary-wide scoring existed
+            out[f"vocab_top{k}"] = bootstrap(counts[f"correct_v{k}"], counts["n"], doms,
+                                             copy.deepcopy(start), reps)["all"]
+            out[f"vocab_top{k}_unseen"] = bootstrap(counts[f"correct_unseen_v{k}"], counts["n_unseen"], doms,
+                                                    copy.deepcopy(start), reps)["all"]
+    return out
 
 
 def mean_counts(runs):
@@ -623,8 +676,9 @@ def per_layer_counts(chosen, counts_by_cfg):
     """Counts of the selected probes: cell l from configuration chosen[l] (the
     configuration chosen for the probe that reads cell l)."""
     out = {}
-    for k in ("correct", "correct_unseen"):
-        out[k] = [counts_by_cfg[c][k][l] for l, c in enumerate(chosen)]
+    for k in counts_by_cfg[chosen[0]]:
+        if k.startswith("correct"):
+            out[k] = [counts_by_cfg[c][k][l] for l, c in enumerate(chosen)]
     for k in ("n", "n_unseen"):
         out[k] = counts_by_cfg[chosen[0]][k]
     return out
@@ -731,6 +785,26 @@ def run(data, splits, args, ckpt, rng_seed, resume=None):
     return res
 
 
+def search_units(res):
+    """Checkpoint units of the search (halving rounds) and CV of a finished run."""
+    units = {}
+    for r, rung in enumerate(res["rungs"]):
+        for c, v in rung.items():
+            units[f"rung{r}/{c}"] = v
+    for c, v in res["cv"].items():
+        for f, (val, best) in enumerate(zip(v["val"], v["best_epoch"])):
+            units[f"cv/{c}/fold{f}"] = {"val": val, "best_epoch": best}
+    return units
+
+
+def retest_compatible(prev, settings, splits):
+    """Same settings (feature files compared by name) and the same documents."""
+    a, b = dict(prev["args"]), dict(settings)
+    fa, fb = a.pop("features"), b.pop("features")
+    names = (lambda f: [Path(x).name for x in (f if isinstance(f, list) else [f])])
+    return a == b and names(fa) == names(fb) and prev["splits"] == splits
+
+
 def main(argv=None):
     from tokid.experiments import Checkpoint
 
@@ -763,6 +837,11 @@ def main(argv=None):
     p.add_argument("--unit-save-min", type=float, default=15.0,
                    help="Save the state of the training unit in progress every this many minutes (<out>.unit.pt), "
                         "so a unit longer than one job resumes after a requeue instead of restarting.")
+    p.add_argument("--retest", action="store_true",
+                   help="Re-test a finished run (--out exists) with the current test metrics, e.g. vocabulary-wide "
+                        "identifiability: the search and CV results are taken from it, the chosen and paper probes "
+                        "are retrained with the same seeds and tested again. The old file is kept as "
+                        "<out stem>.prompt-only.json.")
     args = p.parse_args(argv)
 
     multi = len(args.features) > 1 or args.share != "none"
@@ -783,8 +862,10 @@ def main(argv=None):
                     layers_per_variant=L, hidden_file=[m["hidden_file"] for m in metas])
     out = args.out or Path("results") / (f"{meta['tag']}_{meta['dataset']}" if multi else args.features[0].stem) \
         / "selection.json"
-    if out.exists() and not args.overwrite:
-        p.error(f"{out} exists (use --overwrite)")
+    if args.retest and not out.exists():
+        p.error(f"--retest: {out} does not exist (run the selection first)")
+    if out.exists() and not args.overwrite and not args.retest:
+        p.error(f"{out} exists (use --overwrite, or --retest to re-test it)")
     out.parent.mkdir(parents=True, exist_ok=True)
     cells = probe_cells(args.share, V, L)
     data = QueryData(feats, device, cells)
@@ -799,16 +880,27 @@ def main(argv=None):
           flush=True)
     # Settings of a single-file per-layer run are unchanged, so its old checkpoints still resume.
     settings = {k: v for k, v in vars(args).items() if k not in ("device", "out", "overwrite", "tag", "reserve_gb",
-                                                                  "unit_save_min")}
+                                                                  "unit_save_min", "retest")}
     settings["features"] = [str(f) for f in args.features] if multi else str(args.features[0])
     if not multi:
         settings.pop("share")
-    partial = out.with_name(out.name + ".partial")
+    prev = None
+    if args.retest:
+        prev = json.loads(out.read_text())
+        if not retest_compatible(prev, settings, splits):
+            raise SystemExit(f"--retest: {out} was made with other settings or documents:\n  {prev['args']}\n"
+                             f"now:\n  {settings}")
+        if all(f"vocab_top{VOCAB_KS[0]}" in v for v in prev["test"]["selected"].values()):
+            print(f"[selection] {out} already has the vocabulary-wide test: nothing to do")
+            return
+    partial = out.with_name(out.name + (".retest.partial" if args.retest else ".partial"))
     unit = out.with_name(out.name + ".unit.pt")
     if args.overwrite:
         partial.unlink(missing_ok=True)
         unit.unlink(missing_ok=True)
     ckpt = Checkpoint(partial, settings)
+    if prev is not None:   # search and CV from the finished run; final and paper units are redone
+        ckpt.units.update({k: v for k, v in search_units(prev).items() if k not in ckpt.units})
     resume = UnitResume(unit, settings, every_s=60 * args.unit_save_min)
     t0 = time.time()
     res = run(data, splits, args, ckpt, args.seed, resume)
@@ -817,6 +909,18 @@ def main(argv=None):
     if multi:
         result.update(share=args.share, variants=meta["variants"], layers_per_variant=L,
                       cells=[[c // L, c % L] for c in range(data.num_cells)], probe_cells=cells.tolist())
+    if prev is not None:
+        for k in ("chosen", "final_epochs"):
+            if result[k] != prev[k]:
+                raise SystemExit(f"--retest: {k} differs from {out}; not overwriting it")
+        diff = {t: float(np.max(np.abs(np.subtract(v["all"]["rate"], prev["test"]["selected"][t]["all"]["rate"]))))
+                for t, v in result["test"]["selected"].items() if t in prev["test"]["selected"]}
+        result["retest"] = {"elapsed_s_original": prev.get("elapsed_s"), "max_abs_diff_prompt_rate": diff}
+        print(f"[selection] retest: same-prompt test rates differ from the original run by at most {diff} "
+              "(0 up to GPU non-determinism)", flush=True)
+        backup = out.with_name(out.stem + ".prompt-only.json")
+        if not backup.exists():
+            backup.write_text(json.dumps(prev))
     tmp = out.with_name(out.name + ".tmp")
     tmp.write_text(json.dumps(result))
     os.replace(tmp, out)
@@ -825,6 +929,9 @@ def main(argv=None):
     sel = res["test"]["selected"]
     for name in sel:
         print(f"[selection] test {name}: " + " ".join(f"{r:.3f}" for r in sel[name]["all"]["rate"]))
+        if "vocab_top1" in sel[name]:
+            print(f"[selection] test {name}, vocabulary-wide top-1: "
+                  + " ".join(f"{r:.3f}" for r in sel[name]["vocab_top1"]["rate"]))
     print(f"[selection] done in {result['elapsed_s'] / 60:.1f} min -> {out}")
 
 

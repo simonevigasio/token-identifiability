@@ -19,6 +19,9 @@
 #     MODELS="t5-small elf-xsum-inference" DATASETS=multidoc STAGE=select \
 #       sbatch --dependency=afterok:$jid --array=0-7 slurm/run.sbatch
 #       0=t5-small, 1=t=0, 2-6=t=0.1..0.9, 7=decoder
+#   Vocabulary-wide test of finished selections (no new search; the chosen and paper probes
+#   are retrained with the same seeds and tested against the whole vocabulary too):
+#     MODELS="t5-small elf-xsum-inference" DATASETS=multidoc STAGE=retest sbatch --array=0-7 slurm/run.sbatch
 #   Shared probes across the XSum trajectory (after the extraction above; the hidden states
 #   of all 7 points, ~26 GiB, are spread over the job's GPUs, so ask for 2). Up to ~7x / ~13x
 #   a per-point selection, so allow many restarts:

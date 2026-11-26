@@ -6,6 +6,7 @@ import json
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 from tokid import selection
 from tokid.extract import extract_queries
@@ -397,3 +398,75 @@ def test_shared_selection_end_to_end(tmp_path, share, probes):
     assert (tmp_path / "fig" / "selection" / "shared_delta.png").is_file()
     text = (tmp_path / "fig" / "summary.md").read_text()
     assert f"Shared probe ({share})" in text and "Shared - dedicated" in text
+
+
+@pytest.mark.parametrize("metric", ["cos", "l2"])
+def test_vocab_correct_matches_brute_force(tmp_path, metric):
+    """Vocabulary-wide identifiability: the true token among the k nearest of every row
+    of the embedding matrix, checked against a plain rank computation."""
+    paths = write_variants(tmp_path)
+    data = selection.QueryData(selection.load_cells(paths, torch.device("cpu")), torch.device("cpu"),
+                               selection.probe_cells("time", 2, 4))
+    torch.manual_seed(0)
+    model = BatchedProbe(data.probes, data.x.shape[-1], data.E.shape[-1], hidden=(8,))
+    docs = list(range(30, 40))
+    got = data.vocab_correct(model, docs, metric, ks=(1, 3), chunk=7)   # chunks that split prompts
+    idx = data.queries(docs)
+    true = data.q_tok[idx]
+    for c in range(data.num_cells):
+        p, k = (data.cells == c).nonzero()[0].tolist()
+        pred = model(data.inputs(k, idx))[p].double()
+        E = data.E.double()
+        score = F.normalize(pred, dim=-1) @ F.normalize(E, dim=-1).T if metric == "cos" else -torch.cdist(pred, E)
+        rank = (score > score.gather(1, true[:, None])).sum(1)   # rows strictly nearer than the true token
+        assert torch.equal(got[1][c], rank < 1) and torch.equal(got[3][c], rank < 3)
+    # among the whole vocabulary it can only be harder than among the prompt's own tokens
+    same_prompt = data.correct(model, docs, metric)
+    assert not (got[1] & ~same_prompt).any()
+
+
+def strip_vocab(res):
+    """A result as written before vocabulary-wide scoring existed."""
+    for key in res["test"].values():
+        for t in key.values():
+            for k in [k for k in t if k.startswith("vocab_")]:
+                del t[k]
+    return res
+
+
+def test_selection_reports_vocab_identifiability(tmp_path):
+    path = write_features(tmp_path, d=16)   # hidden size = embedding size: the identity baseline runs too
+    out = tmp_path / "res.json"
+    selection.main(["--features", str(path), "--out", str(out), *TINY])
+    r = json.loads(out.read_text())
+    for key in ("selected", "paper_linear_cos", "naive_cos", "naive_l2"):
+        for t in ("id", "ood"):
+            a, v1, v5 = (r["test"][key][t][f] for f in ("all", "vocab_top1", "vocab_top5"))
+            assert all(x <= y + 1e-12 for x, y in zip(v1["rate"], a["rate"]))
+            assert all(x <= y + 1e-12 for x, y in zip(v1["rate"], v5["rate"]))
+            assert "vocab_top1_unseen" in r["test"][key][t]
+
+
+def test_retest_adds_vocab_scores_and_reproduces_the_run(tmp_path):
+    path = write_features(tmp_path)
+    out = tmp_path / "res" / "selection.json"
+    selection.main(["--features", str(path), "--out", str(out), *TINY])
+    full = json.loads(out.read_text())
+    out.write_text(json.dumps(strip_vocab(json.loads(out.read_text()))))    # an "old" finished run
+
+    with pytest.raises(SystemExit):   # other settings: refused
+        selection.main(["--features", str(path), "--out", str(out), "--retest", *TINY[:-2], "--seed", "1",
+                        "--device", "cpu"])
+    with pytest.raises(SystemExit):   # without --retest an existing result is never touched
+        selection.main(["--features", str(path), "--out", str(out), *TINY])
+
+    selection.main(["--features", str(path), "--out", str(out), "--retest", *TINY])
+    r = json.loads(out.read_text())
+    assert r["test"] == full["test"]   # identical on CPU: same seeds, same CIs, plus the vocabulary scores
+    for k in ("chosen", "rungs", "cv", "final_epochs"):
+        assert r[k] == full[k], k
+    assert r["retest"]["max_abs_diff_prompt_rate"] == {"id": 0.0, "ood": 0.0}
+    assert "vocab_top1" not in json.loads((out.parent / "selection.prompt-only.json").read_text())["test"][
+        "selected"]["id"]
+    assert not list(out.parent.glob("*.partial")) and not list(out.parent.glob("*.unit.pt"))
+    selection.main(["--features", str(path), "--out", str(out), "--retest", *TINY])   # nothing left to do

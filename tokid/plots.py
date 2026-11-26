@@ -301,6 +301,24 @@ def fig_selection(res, out):
         fig.colorbar(im, ax=ax, label="Identifiability rate", fraction=0.04)
         save(fig, out, "selection_by_source")
 
+    if any("vocab_top1" in sel[t] for t in sel):
+        fig, axes = plt.subplots(1, len(sel), figsize=(5.0 * len(sel), 3.6), squeeze=False)
+        for ax, name in zip(axes[0], sel):
+            for field, color, label in (("all", SERIES[0], "among the prompt's tokens (paper)"),
+                                        ("vocab_top5", SERIES[2], "whole vocabulary, top-5"),
+                                        ("vocab_top1", SERIES[1], "whole vocabulary, top-1")):
+                if field in sel[name]:
+                    a = sel[name][field]
+                    ax.fill_between(layers, a["lo"], a["hi"], color=color, alpha=0.15, linewidth=0)
+                    ax.plot(layers, a["rate"], color=color, marker="o", label=label)
+            xticks(ax, layers, elf0)
+            ax.set(xlabel="Layer", ylabel="Test identifiability rate", ylim=(0, 1.02),
+                   title=f"{'In-distribution' if name == 'id' else 'OOD'} test")
+            ax.title.set_fontsize(9)
+        axes[0][0].legend(title="candidates", loc="lower left")
+        fig.suptitle(f"Selected g_l: prompt tokens vs whole vocabulary - {tag}", fontsize=9)
+        save(fig, out, "selection_vocab")
+
     by_len = sel.get("id", {}).get("by_length") or {}
     if by_len:
         fig, ax = plt.subplots(figsize=(4.8, 3.4))
@@ -352,13 +370,15 @@ def _grid(res, key, test="id", field="all"):
     return tuple(np.asarray(a[k], float).reshape(V, L) for k in ("rate", "lo", "hi"))
 
 
-def _base_grid(res, base, test="id"):
-    """(V, L) dedicated-probe rates (NaN where a point has no per-layer run)."""
+def _base_grid(res, base, test="id", field="all"):
+    """(V, L) dedicated-probe rates (NaN where a point has no per-layer run, or the run
+    lacks ``field``, e.g. a vocabulary-wide rate before --retest)."""
     V, L = len(res["variants"]), res["layers_per_variant"]
     g = np.full((V, L), np.nan)
     for v, tag in enumerate(res["variants"]):
-        if tag in base and test in base[tag]["test"]["selected"]:
-            g[v] = base[tag]["test"]["selected"][test]["all"]["rate"]
+        sel = base[tag]["test"]["selected"] if tag in base else {}
+        if field in sel.get(test, {}):
+            g[v] = sel[test][field]["rate"]
     return g
 
 
@@ -474,6 +494,19 @@ def shared_summary(name, res, base):
                       sep, *grid_rows(ded)]
             lines += ["", f"Shared - dedicated, {label} test (percentage points):", "", head, sep,
                       *grid_rows(100 * (rate - ded), fmt="{:+.2f}")]
+        for k in (1, 5):
+            field = f"vocab_top{k}"
+            if field not in res["test"]["selected"][test]:
+                continue
+            vr, vl, vh = _grid(res, "selected", test, field)
+            lines += ["", f"Shared probe, {label} test, whole vocabulary, top-{k}:", "", head, sep,
+                      *grid_rows(vr, vl, vh)]
+            vded = _base_grid(res, base, test, field)
+            if not np.isnan(vded).all():
+                lines += ["", f"Dedicated probes, {label} test, whole vocabulary, top-{k}:", "", head, sep,
+                          *grid_rows(vded)]
+                lines += ["", f"Shared - dedicated, {label} test, whole vocabulary, top-{k} (percentage points):",
+                          "", head, sep, *grid_rows(100 * (vr - vded), fmt="{:+.2f}")]
     for key in res["test"]:
         if key != "selected" and "id" in res["test"][key]:
             rate, _, _ = _grid(res, key, "id")
@@ -495,6 +528,10 @@ def describe_config(cfg):
     return f"{arch}, {loss}, " + ", ".join(extra)
 
 
+VOCAB_ROWS = (("vocab_top1", "whole vocabulary top-1"), ("vocab_top5", "whole vocabulary top-5"),
+              ("vocab_top1_unseen", "whole vocabulary top-1, unseen token types"))
+
+
 def selection_summary(name, res):
     layers = res["layers"]
     head = "| | " + " | ".join(str(l) for l in layers) + " |"
@@ -510,7 +547,10 @@ def selection_summary(name, res):
              f"prompts (OOD sources: {', '.join(res['meta'].get('ood_domains', []))}). Search: "
              f"{len(res['pool'])} configurations, halving rounds {res['args']['rungs']} epochs, "
              f"{len(res['finalists'])} finalists, {res['args']['cv_folds']}-fold CV on dev; refit with "
-             f"{res['args']['seeds']} seeds. Test rate [95% bootstrap CI over prompts]; column = layer.", "",
+             f"{res['args']['seeds']} seeds. Test rate [95% bootstrap CI over prompts]; column = layer. "
+             "Candidates: the distinct tokens of the same prompt (as in the paper); rows marked \"whole "
+             "vocabulary\" use every row of the T5 embedding matrix instead (top-k: the true token among the "
+             "k nearest).", "",
              "Selected configuration per layer (CV mean validation rate is optimistic, it was maximised):", "",
              "| layer | config | CV val rate |", "|---|---|---|"]
     for l, (c, v) in enumerate(zip(res["chosen"], res["chosen_cv_rate"])):
@@ -521,12 +561,17 @@ def selection_summary(name, res):
             lines.append(row(f"selected, {test}", res["test"]["selected"][test]["all"]))
             lines.append(row(f"selected, {test}, unseen token types",
                              res["test"]["selected"][test]["unseen_types"]))
+            for field, text in VOCAB_ROWS:
+                if field in res["test"]["selected"][test]:
+                    lines.append(row(f"selected, {test}, {text}", res["test"]["selected"][test][field]))
     for key, val in res["test"].items():
         if key == "selected":
             continue
         for test in ("id", "ood"):
             if test in val:
                 lines.append(row(f"{key}, {test}", val[test]["all"]))
+                if "vocab_top1" in val[test]:
+                    lines.append(row(f"{key}, {test}, whole vocabulary top-1", val[test]["vocab_top1"]))
     for test in ("id", "ood"):
         sel = res["test"]["selected"].get(test)
         if not sel:
@@ -553,9 +598,9 @@ def table(res, configs, layers, key="test_mean"):
 
 def summary(results, out, baselines=None):
     lines = ["# Token identifiability results", "",
-             "Mean ± std over folds of the test identifiability rate (fraction of tokens whose "
-             "nearest same-sentence neighbour is the correct one). Column = layer "
-             "(0 = input to the first block).", ""]
+             "Test identifiability rate: fraction of tokens whose nearest same-sentence (same-prompt) "
+             "neighbour is the correct one. Column = layer (0 = input to the first block). Cross-validated "
+             "experiments: mean ± std over folds; model selection (multidoc): see each section.", ""]
     for name, res in results.items():
         if res["experiment"] == "selection" and is_shared(res):
             lines += shared_summary(name, res, (baselines or {}).get(name, {}))
