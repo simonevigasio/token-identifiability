@@ -29,9 +29,11 @@ ELF_XSUM_INFERENCE="elf-b-xsum_t0 elf-b-xsum_t0.1 elf-b-xsum_t0.3 elf-b-xsum_t0.
 
 # "elf-xsum-shared": probes shared across the XSum trajectory (dataset multidoc; needs the
 # features of all 7 points above). time = one probe per layer for every point
-# (time-independent), layer = one probe per point for every layer (layer-independent),
-# both = a single probe for every point and layer. Same selection protocol as the per-point runs.
-ELF_XSUM_SHARED="elf-b-xsum_share-time elf-b-xsum_share-layer elf-b-xsum_share-both"
+# (time-independent), layer = one probe per point for every layer (layer-independent).
+# Same selection protocol as the per-point runs. elf-b-xsum_share-both (a single probe for
+# every point and layer) also works when named explicitly, but costs up to ~91x a per-point
+# selection, so it is not in the list.
+ELF_XSUM_SHARED="elf-b-xsum_share-time elf-b-xsum_share-layer"
 
 # expand_models "list" -> the list with the keywords elf-inference / elf-de-en-inference /
 # elf-xsum-inference / elf-xsum-shared replaced

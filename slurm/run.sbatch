@@ -20,11 +20,15 @@
 #       sbatch --dependency=afterok:$jid --array=0-7 slurm/run.sbatch
 #       0=t5-small, 1=t=0, 2-6=t=0.1..0.9, 7=decoder
 #   Shared probes across the XSum trajectory (after the extraction above; the hidden states
-#   of all 7 points, ~26 GiB, are spread over the job's GPUs, so ask for 2):
-#     MODELS=elf-xsum-shared DATASETS=multidoc STAGE=select \
-#       sbatch --gres=gpu:2 --mem=48G --array=0-2 slurm/run.sbatch
-#       0=time-independent (one probe per layer), 1=layer-independent (one probe per point),
-#       2=both (one probe); each compares with the per-point runs' results
+#   of all 7 points, ~26 GiB, are spread over the job's GPUs, so ask for 2). Up to ~7x / ~13x
+#   a per-point selection, so allow many restarts:
+#     MAX_RESTARTS=30 MODELS=elf-xsum-shared DATASETS=multidoc STAGE=select \
+#       sbatch --gres=gpu:2 --mem=48G --array=0-1 slurm/run.sbatch
+#       0=time-independent (one probe per layer), 1=layer-independent (one probe per point);
+#       each compares with the per-point runs' results. On AI Cloud, 6-day jobs on the
+#       prioritized partition need far fewer restarts (command-line options override #SBATCH):
+#     MAX_RESTARTS=5 MODELS=elf-xsum-shared DATASETS=multidoc STAGE=select \
+#       sbatch -p prioritized --time=6-00:00:00 --gres=gpu:2 --mem=48G --array=0-1 slurm/run.sbatch
 #
 # AI-LAB allows at most 12 h per job. Shortly before the limit, the job requeues itself
 # (up to MAX_RESTARTS times). The experiments resume from their .partial checkpoints and

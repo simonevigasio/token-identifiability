@@ -188,7 +188,7 @@ token in the *same form* across those points or layers, not just *somewhere*. A 
 |---|---|---|---|
 | `elf-b-xsum_share-time` | `time` | 13, one per layer | that layer at all 7 points (time-independent) |
 | `elf-b-xsum_share-layer` | `layer` | 7, one per point | all 13 layers of that point (layer-independent) |
-| `elf-b-xsum_share-both` | `both` | 1 | all 91 cells (time- and layer-independent) |
+| `elf-b-xsum_share-both` | `both` | 1 | all 91 cells (time- and layer-independent); **not** in `elf-xsum-shared`, see cost |
 
 * **Same protocol, with "probe" in place of "layer".** The same documents and splits (same
   prompts and seed, so test sets are identical to the per-point runs), the same 52
@@ -203,8 +203,19 @@ token in the *same form* across those points or layers, not just *somewhere*. A 
   per-point runs (`results/elf-b-xsum_<point>_multidoc/`, used when present):
   `shared_layers` (rate per layer, shared vs dedicated) and `shared_delta` (shared minus
   dedicated, in percentage points, per point and layer), plus tables in `summary.md`.
-* **Cost and memory.** An epoch covers 7×, 13× or 91× more pairs than a per-point probe sees,
-  so each run costs about as much as the 7 per-point selections together. The hidden states
+* **Cost.** An epoch covers 7×, 13× or 91× more pairs than a per-point probe sees, so a
+  training unit (one halving round, CV fold, refit seed or paper probe) takes up to that many
+  times longer. On AI-LAB the slowest per-point units ran at ~21 s/epoch, so a unit of
+  ~100-200 epochs takes up to ~4-8 h (time), ~8-15 h (layer) or ~2-4 days (both), and a whole
+  run up to ~7× (time) or ~13× (layer) one per-point selection. `both` (up to ~91×) is
+  therefore left out of `elf-xsum-shared`; run it explicitly with
+  `MODELS=elf-b-xsum_share-both` if wanted.
+* **Units longer than one job.** Besides the per-unit checkpoint, the state of the unit in
+  progress (weights, optimizer, early stopping, random generators) is saved every
+  `--unit-save-min` minutes (default 15) to `<out>.unit.pt`, so a unit that outlasts the
+  12 h limit resumes after the requeue and ends exactly as without the break
+  (`tests/test_selection.py`). Give the jobs enough restarts (`MAX_RESTARTS`, below).
+* **Memory.** The hidden states
   of all 7 points (~26 GiB float16) do not fit on one 24 GB GPU. They are spread over all of
   the job's GPUs (`CellStore`), keeping `--reserve-gb` (default 4) free on the first GPU, so
   the Slurm jobs ask for 2 GPUs. With `--share none` and one features file, the code is the
@@ -258,10 +269,14 @@ MODELS="t5-small elf-de-en-inference" DATASETS=wmt14 sbatch --array=0-7 slurm/ru
 jid=$(MODELS="t5-small elf-b-xsum_t0" DATASETS=multidoc STAGE=extract sbatch --parsable --array=0-1 slurm/run.sbatch)
 MODELS="t5-small elf-xsum-inference" DATASETS=multidoc STAGE=select \
   sbatch --dependency=afterok:$jid --array=0-7 slurm/run.sbatch
-#    shared probes (0=time-independent, 1=layer-independent, 2=both), after the extraction;
+#    shared probes (0=time-independent, 1=layer-independent), after the extraction; up to
+#    ~7x / ~13x a per-point selection, hence many restarts;
 #    2 GPUs because the hidden states of all 7 points (~26 GiB) are spread over them:
-MODELS=elf-xsum-shared DATASETS=multidoc STAGE=select \
-  sbatch --gres=gpu:2 --mem=48G --array=0-2 slurm/run.sbatch
+MAX_RESTARTS=30 MODELS=elf-xsum-shared DATASETS=multidoc STAGE=select \
+  sbatch --gres=gpu:2 --mem=48G --array=0-1 slurm/run.sbatch
+#    ... or on AI Cloud, 6-day jobs on the prioritized partition (far fewer restarts):
+MAX_RESTARTS=5 MODELS=elf-xsum-shared DATASETS=multidoc STAGE=select \
+  sbatch -p prioritized --time=6-00:00:00 --gres=gpu:2 --mem=48G --array=0-1 slurm/run.sbatch
 
 # 3. monitor
 squeue --me

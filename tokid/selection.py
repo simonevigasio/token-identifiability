@@ -411,8 +411,52 @@ def build_probe(cfg, data, train_idx, seed):
                         generator=gen).to(data.device)
 
 
+class UnitResume:
+    """Training state of the unit in progress, saved every ``every_s`` seconds.
+
+    The run checkpoint (``Checkpoint``) saves only between units, so a unit longer than
+    one Slurm job (e.g. a shared probe on AI-LAB's 12 h limit) would restart from
+    scratch on every requeue and never finish. This file holds the weights, optimizer,
+    early-stopping state and random generators of the current unit, after a whole
+    epoch, so the unit resumes where it stopped and ends exactly as without the break.
+    A state is used only by the same unit of a run with the same settings."""
+
+    def __init__(self, path, settings, every_s=900.0):
+        self.path, self.settings, self.every_s = path, settings, every_s
+
+    def load(self, key):
+        if self.path is None or not self.path.exists():
+            return None
+        state = torch.load(self.path, map_location="cpu", weights_only=False)
+        if state.get("key") != key or state.get("settings") != self.settings:
+            return None
+        return state
+
+    def save(self, key, state):
+        if self.path is None:
+            return
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        torch.save({"key": key, "settings": self.settings, **state}, tmp)
+        os.replace(tmp, self.path)
+
+    def clear(self):
+        if self.path is not None:
+            self.path.unlink(missing_ok=True)
+
+
+def _rng_state(dev):
+    return {"cpu": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state(dev) if dev.type == "cuda" else None}
+
+
+def _set_rng_state(state, dev):
+    torch.set_rng_state(state["cpu"])
+    if dev.type == "cuda":
+        torch.cuda.set_rng_state(state["cuda"], dev)
+
+
 def train(cfg, data, train_docs, val_docs=None, seed=0, max_epochs=200, patience=10, stop_on="rate",
-          epochs_per_layer=None, log=""):
+          epochs_per_layer=None, log="", resume=None, key=None):
     """Train the P probes of one configuration (one per layer in the per-layer protocol).
 
     An epoch is one pass over the probe's training set: every (training query, cell)
@@ -420,7 +464,8 @@ def train(cfg, data, train_docs, val_docs=None, seed=0, max_epochs=200, patience
     per-probe early stopping on the validation identifiability rate, averaged over the
     probe's cells (``stop_on="rate"``), or loss (``"loss"``, the paper); each probe keeps
     its best epoch's weights. With ``epochs_per_layer`` (refit, no validation): probe p
-    keeps its weights after epochs_per_layer[p] epochs."""
+    keeps its weights after epochs_per_layer[p] epochs. With ``resume`` (a UnitResume)
+    and ``key``: the unit's state is saved periodically and a saved state is resumed."""
     G, dev = data.probes, data.device
     torch.manual_seed(seed)  # dropout draws from the global generator: every unit reproducible on its own
     tr = data.queries(train_docs)
@@ -437,8 +482,21 @@ def train(cfg, data, train_docs, val_docs=None, seed=0, max_epochs=200, patience
     if epochs_per_layer is not None:
         target = torch.as_tensor(epochs_per_layer, device=dev)
         max_epochs = int(target.max())
-    bs, t0, epoch = cfg["batch_size"], time.time(), -1
-    for epoch in range(max_epochs):
+    bs, t0, epoch, start, done_s = cfg["batch_size"], time.time(), -1, 0, 0.0
+    state = resume.load(key) if resume is not None else None
+    if state is not None:
+        model.load_state_dict(state["model"])
+        opt.load_state_dict(state["opt"])
+        for s, v in zip(snap, state["snap"]):
+            s.copy_(v)
+        best, best_epoch, active = (state[k].to(dev) for k in ("best", "best_epoch", "active"))
+        gen.set_state(state["gen"])
+        _set_rng_state(state["rng"], dev)
+        epoch = start = state["epoch"] + 1
+        done_s = state["seconds"]
+        print(f"  {log}: resumed after epoch {start}", flush=True)
+    last_save = time.time()
+    for epoch in range(start, max_epochs):
         model.train()
         # pair j = (slot j // n_tr, query tr[j % n_tr]); with K = 1 this is a plain permutation of tr
         perm = torch.randperm(data.share_k * n_tr, generator=gen).to(dev)
@@ -468,11 +526,19 @@ def train(cfg, data, train_docs, val_docs=None, seed=0, max_epochs=200, patience
             active &= (epoch - best_epoch) < patience
             if not bool(active.any()):
                 break
+        if resume is not None and epoch + 1 < max_epochs and time.time() - last_save >= resume.every_s:
+            resume.save(key, {"epoch": epoch, "model": model.state_dict(), "opt": opt.state_dict(),
+                              "snap": snap, "best": best, "best_epoch": best_epoch, "active": active,
+                              "gen": gen.get_state(), "rng": _rng_state(dev),
+                              "seconds": done_s + time.time() - t0})
+            last_save = time.time()
     with torch.no_grad():
         for p, s in zip(params, snap):
             p.copy_(s)
     model.eval()
-    info = {"epochs_run": epoch + 1, "seconds": round(time.time() - t0, 1)}
+    if resume is not None:
+        resume.clear()
+    info = {"epochs_run": epoch + 1, "seconds": round(done_s + time.time() - t0, 1)}
     if epochs_per_layer is None:
         info.update(best_epoch=best_epoch.tolist(), best=best.tolist())
     if log:
@@ -563,7 +629,7 @@ def per_layer_counts(chosen, counts_by_cfg):
 
 # ---------------------------------------------------------------------------- protocol
 
-def run(data, splits, args, ckpt, rng_seed):
+def run(data, splits, args, ckpt, rng_seed, resume=None):
     """The protocol with one *probe* as the unit of every choice: halving promotes a
     configuration that ranks high for some probe, each probe picks its own configuration
     by CV, and gets its own refit epochs. Per-layer protocol: probe = layer. Rates are
@@ -584,7 +650,7 @@ def run(data, splits, args, ckpt, rng_seed):
             key = f"rung{r}/{c}"
             if ckpt.get(key) is None:
                 _, info = train(pool[c], data, search["train"], search["val"], seed_of[c], max_epochs=budget,
-                                patience=budget, log=f"rung {r} ({budget} ep) {c}")
+                                patience=budget, log=f"rung {r} ({budget} ep) {c}", resume=resume, key=key)
                 ckpt.put(key, {"val": info["best"], "best_epoch": info["best_epoch"]})
             rung[c] = ckpt.get(key)
         res["rungs"].append(rung)
@@ -600,7 +666,8 @@ def run(data, splits, args, ckpt, rng_seed):
             key = f"cv/{c}/fold{f}"
             if ckpt.get(key) is None:
                 _, info = train(pool[c], data, fold["train"], fold["val"], seed_of[c] + 100 * (f + 1),
-                                max_epochs=args.max_epochs, patience=args.patience, log=f"cv {c} fold {f}")
+                                max_epochs=args.max_epochs, patience=args.patience, log=f"cv {c} fold {f}",
+                                resume=resume, key=key)
                 ckpt.put(key, {"val": info["best"], "best_epoch": info["best_epoch"]})
             folds.append(ckpt.get(key))
         res["cv"][c] = {"val": [f["val"] for f in folds], "best_epoch": [f["best_epoch"] for f in folds],
@@ -622,7 +689,8 @@ def run(data, splits, args, ckpt, rng_seed):
             key = f"final/{c}/seed{s}"
             if ckpt.get(key) is None:
                 model, _ = train(pool[c], data, splits["dev"], seed=seed_of[c] + 10_000 * (s + 1),
-                                 epochs_per_layer=res["final_epochs"][c], log=f"final {c} seed {s}")
+                                 epochs_per_layer=res["final_epochs"][c], log=f"final {c} seed {s}",
+                                 resume=resume, key=key)
                 ckpt.put(key, {name: doc_counts(data, model, docs, metric_of(pool[c]), seen)
                                for name, docs in test_sets.items() if docs})
             runs.append(ckpt.get(key))
@@ -633,7 +701,8 @@ def run(data, splits, args, ckpt, rng_seed):
         key = f"paper/{name}"
         if ckpt.get(key) is None:
             model, _ = train(cfg, data, search["train"], search["val"], seed_of[name] + 50_000,
-                             max_epochs=args.paper_max_epochs, patience=20, stop_on="loss", log=f"paper {name}")
+                             max_epochs=args.paper_max_epochs, patience=20, stop_on="loss", log=f"paper {name}",
+                             resume=resume, key=key)
             ckpt.put(key, {n: doc_counts(data, model, docs, metric_of(cfg), seen)
                            for n, docs in test_sets.items() if docs})
     if data.x.shape[-1] == data.E.shape[-1]:  # g = identity (T5-small)
@@ -688,6 +757,9 @@ def main(argv=None):
     p.add_argument("--device", default="auto")
     p.add_argument("--out", type=Path, default=None)
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--unit-save-min", type=float, default=15.0,
+                   help="Save the state of the training unit in progress every this many minutes (<out>.unit.pt), "
+                        "so a unit longer than one job resumes after a requeue instead of restarting.")
     args = p.parse_args(argv)
 
     multi = len(args.features) > 1 or args.share != "none"
@@ -723,16 +795,20 @@ def main(argv=None):
           f"test id {len(splits['test_id'])} / test ood {len(splits['test_ood'])} prompts; device={device}",
           flush=True)
     # Settings of a single-file per-layer run are unchanged, so its old checkpoints still resume.
-    settings = {k: v for k, v in vars(args).items() if k not in ("device", "out", "overwrite", "tag", "reserve_gb")}
+    settings = {k: v for k, v in vars(args).items() if k not in ("device", "out", "overwrite", "tag", "reserve_gb",
+                                                                  "unit_save_min")}
     settings["features"] = [str(f) for f in args.features] if multi else str(args.features[0])
     if not multi:
         settings.pop("share")
     partial = out.with_name(out.name + ".partial")
-    if args.overwrite and partial.exists():
-        partial.unlink()
+    unit = out.with_name(out.name + ".unit.pt")
+    if args.overwrite:
+        partial.unlink(missing_ok=True)
+        unit.unlink(missing_ok=True)
     ckpt = Checkpoint(partial, settings)
+    resume = UnitResume(unit, settings, every_s=60 * args.unit_save_min)
     t0 = time.time()
-    res = run(data, splits, args, ckpt, args.seed)
+    res = run(data, splits, args, ckpt, args.seed, resume)
     result = {"meta": meta, "experiment": "selection", "args": settings, "splits": splits,
               "layers": list(range(data.num_cells)), "elapsed_s": time.time() - t0, **res}
     if multi:
@@ -742,6 +818,7 @@ def main(argv=None):
     tmp.write_text(json.dumps(result))
     os.replace(tmp, out)
     partial.unlink(missing_ok=True)
+    unit.unlink(missing_ok=True)
     sel = res["test"]["selected"]
     for name in sel:
         print(f"[selection] test {name}: " + " ".join(f"{r:.3f}" for r in sel[name]["all"]["rate"]))

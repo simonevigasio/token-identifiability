@@ -319,6 +319,63 @@ def test_shared_probes_are_independent_of_each_other(tmp_path):
     assert weights[0][1] == weights[1][1]
 
 
+class StopAfter(selection.UnitResume):
+    """Simulated time limit: the job dies right after the n-th saved epoch."""
+
+    def __init__(self, *a, n, **kw):
+        super().__init__(*a, **kw)
+        self.n = n
+
+    def save(self, key, state):
+        super().save(key, state)
+        self.n -= 1
+        if self.n == 0:
+            raise KeyboardInterrupt("simulated time limit")
+
+
+def test_unit_saving_does_not_change_the_selection(tmp_path):
+    path = write_features(tmp_path)
+    ref, out = tmp_path / "ref.json", tmp_path / "res.json"
+    selection.main(["--features", str(path), "--out", str(ref), *TINY])
+    selection.main(["--features", str(path), "--out", str(out), "--unit-save-min", "0", *TINY])
+    a, b = json.loads(ref.read_text()), json.loads(out.read_text())
+    for k in ("chosen", "rungs", "cv", "final_epochs", "test", "args"):
+        assert a[k] == b[k], k
+    assert not (tmp_path / "res.json.unit.pt").exists()
+
+
+@pytest.mark.parametrize("refit", [False, True])
+def test_unit_resumes_mid_training_identically(tmp_path, refit):
+    """A unit killed after some epochs continues from its saved state and ends exactly
+    as an uninterrupted one (weights, early stopping), dropout and shuffling included."""
+    paths = write_variants(tmp_path)
+    data = selection.QueryData(selection.load_cells(paths, torch.device("cpu")), torch.device("cpu"),
+                               selection.probe_cells("layer", 2, 4))
+    cfg = {"arch": "mlp", "depth": 1, "width": 8, "dropout": 0.2, "standardize": True, "loss": "infonce",
+           "tau": 0.1, "lr": 1e-3, "weight_decay": 0.01, "batch_size": 16}
+    kw = {"epochs_per_layer": [5, 7]} if refit else {"val_docs": list(range(20, 30)), "max_epochs": 8,
+                                                      "patience": 3}
+    ref, ref_info = selection.train(cfg, data, list(range(20)), seed=3, **kw)
+
+    path, settings = tmp_path / "x.unit.pt", {"run": 1}
+    with pytest.raises(KeyboardInterrupt):
+        selection.train(cfg, data, list(range(20)), seed=3, resume=StopAfter(path, settings, every_s=0, n=3),
+                        key="cv/a/fold0", **kw)
+    assert torch.load(path, weights_only=False)["epoch"] == 2
+    # a state of another unit, or of a run with other settings, is not used
+    assert selection.UnitResume(path, settings).load("cv/a/fold1") is None
+    assert selection.UnitResume(path, {"run": 2}).load("cv/a/fold0") is None
+
+    model, info = selection.train(cfg, data, list(range(20)), seed=3,
+                                  resume=selection.UnitResume(path, settings, every_s=0), key="cv/a/fold0", **kw)
+    assert not path.exists()  # cleared once the unit is done
+    for k, v in ref.state_dict().items():
+        torch.testing.assert_close(model.state_dict()[k], v, rtol=0, atol=0)
+    assert info["epochs_run"] == ref_info["epochs_run"]
+    if not refit:
+        assert info["best_epoch"] == ref_info["best_epoch"] and info["best"] == ref_info["best"]
+
+
 @pytest.mark.parametrize("share,probes", [("time", 4), ("layer", 2), ("both", 1)])
 def test_shared_selection_end_to_end(tmp_path, share, probes):
     from tokid import plots

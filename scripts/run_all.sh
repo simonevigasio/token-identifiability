@@ -18,9 +18,9 @@
 #                             (summarization ELF-B, 17 sources, prompts of 64-512 tokens: model
 #                              selection of g_l with a locked test set, tokid.selection)
 #   MODELS="elf-xsum-shared" bash scripts/run_all.sh multidoc
-#                             (probes shared across the 7 XSum trajectory points and/or the
-#                              layers: time-, layer-, and time+layer-independent; needs the
-#                              multidoc features of all 7 points)
+#                             (probes shared across the 7 XSum trajectory points or the
+#                              layers: time- and layer-independent; needs the multidoc
+#                              features of all 7 points. MODELS=elf-b-xsum_share-both: both)
 #   STAGE=extract|select|all  (multidoc only; default all. The ELF extraction writes all 7
 #                              trajectory points at once, so on Slurm run STAGE=extract first,
 #                              then the selection jobs; see slurm/run.sbatch)
