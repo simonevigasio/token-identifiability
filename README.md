@@ -177,6 +177,39 @@ score would overstate that bound, so no test document is ever used for a decisio
   many `<unk>` tokens. All of them share one embedding, so retrieving any `<unk>` counts
   as correct (same rule as for repeated words).
 
+### Shared probes: is g time- or layer-independent? (`multidoc`, `--share`)
+
+The selection above trains a separate g for every (trajectory point, layer) pair. Here one g
+is shared by several of them. If a shared g does as well as the dedicated ones, ELF keeps the
+token in the *same form* across those points or layers, not just *somewhere*. A cell is one
+(point, layer) pair: 7 points (t0, t0.1, …, t0.9, decoder) × 13 layers = 91 cells.
+
+| run (`MODELS=elf-xsum-shared`) | `--share` | probes | each probe is trained on |
+|---|---|---|---|
+| `elf-b-xsum_share-time` | `time` | 13, one per layer | that layer at all 7 points (time-independent) |
+| `elf-b-xsum_share-layer` | `layer` | 7, one per point | all 13 layers of that point (layer-independent) |
+| `elf-b-xsum_share-both` | `both` | 1 | all 91 cells (time- and layer-independent) |
+
+* **Same protocol, with "probe" in place of "layer".** The same documents and splits (same
+  prompts and seed, so test sets are identical to the per-point runs), the same 52
+  configurations, successive halving, 4-fold CV, refit with 3 seeds, paper probes and
+  bootstrap CIs. A probe's training set is every (query, cell) pair of its cells, and an
+  epoch passes over all of them. Early stopping and CV selection use the validation rate
+  averaged over the probe's cells. A configuration survives halving if it ranks high for
+  some probe, and each probe picks its own configuration. Input standardization uses the
+  probe's pooled data, so nothing cell-specific enters a shared probe.
+* **Output:** the test rate for every cell (`results/elf-b-xsum_share-<mode>_multidoc/selection.json`).
+  `figures/elf-b-xsum_share-<mode>_multidoc/` compares it with the dedicated probes of the
+  per-point runs (`results/elf-b-xsum_<point>_multidoc/`, used when present):
+  `shared_layers` (rate per layer, shared vs dedicated) and `shared_delta` (shared minus
+  dedicated, in percentage points, per point and layer), plus tables in `summary.md`.
+* **Cost and memory.** An epoch covers 7×, 13× or 91× more pairs than a per-point probe sees,
+  so each run costs about as much as the 7 per-point selections together. The hidden states
+  of all 7 points (~26 GiB float16) do not fit on one 24 GB GPU. They are spread over all of
+  the job's GPUs (`CellStore`), keeping `--reserve-gb` (default 4) free on the first GPU, so
+  the Slurm jobs ask for 2 GPUs. With `--share none` and one features file, the code is the
+  per-layer protocol, unchanged: `tests/test_selection.py` covers both.
+
 Implementation notes:
 * The G layers of a model are trained together as G independent probes: parameters have a
   leading layer dimension, the loss is the sum of per-layer losses, and early stopping and
@@ -225,12 +258,19 @@ MODELS="t5-small elf-de-en-inference" DATASETS=wmt14 sbatch --array=0-7 slurm/ru
 jid=$(MODELS="t5-small elf-b-xsum_t0" DATASETS=multidoc STAGE=extract sbatch --parsable --array=0-1 slurm/run.sbatch)
 MODELS="t5-small elf-xsum-inference" DATASETS=multidoc STAGE=select \
   sbatch --dependency=afterok:$jid --array=0-7 slurm/run.sbatch
+#    shared probes (0=time-independent, 1=layer-independent, 2=both), after the extraction;
+#    2 GPUs because the hidden states of all 7 points (~26 GiB) are spread over them:
+MODELS=elf-xsum-shared DATASETS=multidoc STAGE=select \
+  sbatch --gres=gpu:2 --mem=48G --array=0-2 slurm/run.sbatch
 
 # 3. monitor
 squeue --me
 tail -f logs/tokid_<jobid>_2.out
 ```
 
+* GPUs: the V100 nodes `nv-ai-02` and `nv-ai-03` are excluded in `slurm/run.sbatch`. Their compute
+  capability (7.0) is below what the container's PyTorch supports (≥ 7.5), so every job there fails
+  with `no kernel image is available for execution on the device`. Every other GPU node works.
 * Resources per job: 1 GPU, 8 CPUs, 24 GB RAM, 12 h. Those fit AI-LAB's limits: ≤24 GB and
   ≤15 CPUs per GPU, ≤12 h per job, ≤4 GPUs per job, ≤8 GPUs and 8 jobs per user.
 * **12 h limit:** Slurm signals the job 10 min before the limit, and the job requeues itself

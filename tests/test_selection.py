@@ -242,3 +242,101 @@ def test_extract_queries_resumes_when_killed_while_finalizing(tmp_path, monkeypa
         np.testing.assert_array_equal(np.load(ref[l].with_name(f"x_{l}_multidoc.hidden.npy")),
                                       np.load(out[l].with_name(f"x_{l}_multidoc.hidden.npy")))
     assert not (tmp_path / "x_a_multidoc.progress.json").exists()
+
+
+# ------------------------------------------------------------------ shared probes (--share)
+
+def write_variants(tmp_path, names=("t0", "t1"), scales=(1.0, 2.0), layers=3, n_docs=40, vocab=40):
+    """Feature files of the same prompts for several 'trajectory points' (layers + input)."""
+    torch.manual_seed(0)
+    embedding, proj = torch.randn(vocab, 16), torch.randn(16, 24)
+    base = fake_run(embedding, proj, layers)
+
+    def run(ids, index):
+        out = base(ids, index)["p"]
+        return {n: {"tokens": out["tokens"], "hidden": [s * h for h in out["hidden"]]} for n, s in zip(names, scales)}
+
+    paths = {n: tmp_path / f"fake_{n}_multidoc.pt" for n in names}
+    meta = lambda label: {"model": "fake", "tag": f"fake_{label}", "dataset": "multidoc",  # noqa: E731
+                          "domain_names": ["a", "b", "c", "d"], "ood_domains": ["d"]}
+    extract_queries(run, list(names), fake_prompts(n_docs, vocab=vocab), paths, embedding, meta, log_every=7)
+    return [paths[n] for n in names]
+
+
+def test_probe_cells():
+    assert selection.probe_cells("none", 2, 3).tolist() == [[0], [1], [2], [3], [4], [5]]
+    assert selection.probe_cells("time", 2, 3).tolist() == [[0, 3], [1, 4], [2, 5]]
+    assert selection.probe_cells("layer", 2, 3).tolist() == [[0, 1, 2], [3, 4, 5]]
+    assert selection.probe_cells("both", 2, 3).tolist() == [[0, 1, 2, 3, 4, 5]]
+
+
+def test_cell_store_shards_match_one_tensor():
+    x = torch.randn(5, 7, 3).half()
+    one = selection.CellStore([(x, list(range(5)))], "cpu")
+    two = selection.CellStore([(x[[0, 2, 4]], [0, 2, 4]), (x[[1, 3]], [1, 3])], "cpu")
+    c, q = torch.randint(0, 5, (4, 6)), torch.randint(0, 7, (6,))
+    torch.testing.assert_close(one.gather(c, q), x[c, q], rtol=0, atol=0)
+    torch.testing.assert_close(two.gather(c, q), x[c, q], rtol=0, atol=0)
+
+
+def test_load_cells_rejects_different_prompts(tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    a = write_variants(tmp_path / "a", names=("t0",), scales=(1.0,))
+    b = write_variants(tmp_path / "b", names=("t0",), scales=(1.0,), n_docs=30)
+    with pytest.raises(ValueError, match="different prompts"):
+        selection.load_cells([a[0], b[0]], torch.device("cpu"))
+
+
+def test_shared_standardization_pools_the_cells(tmp_path):
+    paths = write_variants(tmp_path)
+    feats = selection.load_cells(paths, torch.device("cpu"))
+    data = selection.QueryData(feats, torch.device("cpu"), selection.probe_cells("both", 2, 4))
+    tr = data.queries(range(12))
+    cfg = {"arch": "linear", "depth": 0, "width": 0, "dropout": 0.0, "standardize": True}
+    model = selection.build_probe(cfg, data, tr, seed=0)
+    pooled = torch.cat([data.x.gather(torch.full((1, tr.numel()), c), tr)[0] for c in range(8)]).double()
+    torch.testing.assert_close(model.mean[0, 0], pooled.mean(0).float())
+
+
+def test_shared_probes_are_independent_of_each_other(tmp_path):
+    """share=layer: the probe of point t0 must not depend on the states of point t1."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    a = write_variants(tmp_path / "a", scales=(1.0, 2.0))
+    b = write_variants(tmp_path / "b", scales=(1.0, -3.0))
+    cfg = {"arch": "mlp", "depth": 1, "width": 8, "dropout": 0.1, "standardize": True, "loss": "infonce",
+           "tau": 0.1, "lr": 1e-3, "weight_decay": 0.01, "batch_size": 16}
+    weights = []
+    for paths in (a, b):
+        data = selection.QueryData(selection.load_cells(paths, torch.device("cpu")), torch.device("cpu"),
+                                   selection.probe_cells("layer", 2, 4))
+        model, info = selection.train(cfg, data, list(range(20)), list(range(20, 30)), seed=3, max_epochs=4,
+                                      patience=2)
+        weights.append(([w[0].clone() for w in model.weights], info["best_epoch"][0]))
+    for wa, wb in zip(weights[0][0], weights[1][0]):
+        torch.testing.assert_close(wa, wb, rtol=0, atol=0)
+    assert weights[0][1] == weights[1][1]
+
+
+@pytest.mark.parametrize("share,probes", [("time", 4), ("layer", 2), ("both", 1)])
+def test_shared_selection_end_to_end(tmp_path, share, probes):
+    from tokid import plots
+
+    paths = write_variants(tmp_path)
+    root = tmp_path / "results"
+    for p in paths:  # dedicated per-point runs: the comparison in the summary
+        selection.main(["--features", str(p), "--out", str(root / p.stem / "selection.json"), *TINY])
+    out = root / f"fake_share-{share}_multidoc" / "selection.json"
+    selection.main(["--features", *map(str, paths), "--share", share, "--out", str(out), *TINY])
+    r = json.loads(out.read_text())
+    assert r["meta"]["tag"] == f"fake_share-{share}" and r["share"] == share
+    assert len(r["chosen"]) == probes and len(r["probe_cells"]) == probes
+    assert len(r["test"]["selected"]["id"]["all"]["rate"]) == 8 and r["cells"][5] == [1, 1]
+    ded = json.loads((root / paths[0].stem / "selection.json").read_text())
+    assert r["splits"] == ded["splits"]  # same documents as the per-point runs
+    plots.main(["--results", str(out.parent), "--out", str(tmp_path / "fig")])
+    assert (tmp_path / "fig" / "selection" / "shared_layers.png").is_file()
+    assert (tmp_path / "fig" / "selection" / "shared_delta.png").is_file()
+    text = (tmp_path / "fig" / "summary.md").read_text()
+    assert f"Shared probe ({share})" in text and "Shared - dedicated" in text

@@ -27,8 +27,14 @@ ELF_DEEN_INFERENCE="elf-b-de-en_t0 elf-b-de-en_t0.1_g2_scpred elf-b-de-en_t0.3_g
 # first step t = 0, the steps starting at t = 0.1 ... 0.9, final decoder step. Run with DATASETS=docmix.
 ELF_XSUM_INFERENCE="elf-b-xsum_t0 elf-b-xsum_t0.1 elf-b-xsum_t0.3 elf-b-xsum_t0.5 elf-b-xsum_t0.7 elf-b-xsum_t0.9 elf-b-xsum_decoder"
 
+# "elf-xsum-shared": probes shared across the XSum trajectory (dataset multidoc; needs the
+# features of all 7 points above). time = one probe per layer for every point
+# (time-independent), layer = one probe per point for every layer (layer-independent),
+# both = a single probe for every point and layer. Same selection protocol as the per-point runs.
+ELF_XSUM_SHARED="elf-b-xsum_share-time elf-b-xsum_share-layer elf-b-xsum_share-both"
+
 # expand_models "list" -> the list with the keywords elf-inference / elf-de-en-inference /
-# elf-xsum-inference replaced
+# elf-xsum-inference / elf-xsum-shared replaced
 expand_models() {
   local out=() m
   for m in $1; do
@@ -40,6 +46,9 @@ expand_models() {
       out+=("${extra[@]}")
     elif [ "$m" = elf-xsum-inference ]; then
       read -r -a extra <<< "$ELF_XSUM_INFERENCE"
+      out+=("${extra[@]}")
+    elif [ "$m" = elf-xsum-shared ]; then
+      read -r -a extra <<< "$ELF_XSUM_SHARED"
       out+=("${extra[@]}")
     else
       out+=("$m")

@@ -8,6 +8,7 @@ Writes PNG + PDF figures and a ``summary.md`` with all mean rates.
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import matplotlib
@@ -313,6 +314,176 @@ def fig_selection(res, out):
         save(fig, out, "selection_by_length")
 
 
+SHARE_TEXT = {
+    "none": "one probe per (point, layer)",
+    "time": "time-independent: one probe per layer, shared by every point of the trajectory",
+    "layer": "layer-independent: one probe per point, shared by every layer",
+    "both": "time- and layer-independent: one probe for every (point, layer)",
+}
+
+
+def is_shared(res):
+    return "variants" in res
+
+
+def variant_names(tags):
+    """Tags without their common prefix: elf-b-xsum_t0.1 -> t0.1."""
+    prefix = os.path.commonprefix(list(tags))
+    prefix = prefix[:prefix.rfind("_") + 1] if "_" in prefix else ""
+    return [t[len(prefix):] or t for t in tags]
+
+
+def load_baseline(res, root):
+    """The dedicated per-layer runs of each point (results/<tag>_<dataset>/selection.json), if present."""
+    out = {}
+    for tag in res["variants"]:
+        f = Path(root) / f"{tag}_{res['meta']['dataset']}" / "selection.json"
+        if f.is_file():
+            b = load(f)
+            if b.get("splits") == res["splits"]:  # same documents, else not comparable
+                out[tag] = b
+    return out
+
+
+def _grid(res, key, test="id", field="all"):
+    """Per-cell values of res['test'][key][test][field] -> (V, L) arrays rate, lo, hi."""
+    V, L = len(res["variants"]), res["layers_per_variant"]
+    a = res["test"][key][test][field]
+    return tuple(np.asarray(a[k], float).reshape(V, L) for k in ("rate", "lo", "hi"))
+
+
+def _base_grid(res, base, test="id"):
+    """(V, L) dedicated-probe rates (NaN where a point has no per-layer run)."""
+    V, L = len(res["variants"]), res["layers_per_variant"]
+    g = np.full((V, L), np.nan)
+    for v, tag in enumerate(res["variants"]):
+        if tag in base and test in base[tag]["test"]["selected"]:
+            g[v] = base[tag]["test"]["selected"][test]["all"]["rate"]
+    return g
+
+
+def fig_shared(res, out, base):
+    """Shared probes (tokid.selection --share): test rate per point and layer, against the
+    dedicated per-layer probes of each point, and the difference shared - dedicated."""
+    names = variant_names(res["variants"])
+    L = res["layers_per_variant"]
+    layers = np.arange(L)
+    elf0 = not trivial_layer0({"meta": res["meta"], "configs": {}})
+    tag, share = res["meta"]["tag"], res["share"]
+    tests = [t for t in ("id", "ood") if t in res["test"]["selected"]]
+    fig, axes = plt.subplots(1, len(tests), figsize=(5.2 * len(tests), 3.8), squeeze=False)
+    lo_all = 1.0
+    for ax, test in zip(axes[0], tests):
+        rate, _, _ = _grid(res, "selected", test)
+        ded = _base_grid(res, base, test)
+        for v, name in enumerate(names):
+            color = SERIES[v % len(SERIES)]
+            ax.plot(layers, rate[v], color=color, marker="o", label=name)
+            if not np.isnan(ded[v]).all():
+                ax.plot(layers, ded[v], color=color, linestyle="--", linewidth=1, alpha=0.7)
+        lo_all = min(lo_all, np.nanmin(rate), np.nanmin(ded) if not np.isnan(ded).all() else 1.0)
+        xticks(ax, layers, elf0)
+        ax.set(xlabel="Layer", ylabel="Test identifiability rate",
+               title=f"{'In-distribution' if test == 'id' else 'OOD'} test")
+        ax.title.set_fontsize(9)
+    for ax in axes[0]:
+        ax.set_ylim(max(0.0, lo_all - 0.01), 1.002)
+    axes[0][0].legend(title="point (solid: shared, dashed: dedicated)", loc="lower left", ncol=2)
+    fig.suptitle(f"Shared probe ({share}) - {tag}", fontsize=9)
+    save(fig, out, "shared_layers")
+
+    ded = _base_grid(res, base, "id")
+    if not np.isnan(ded).all():
+        rate, _, _ = _grid(res, "selected", "id")
+        delta = 100 * (rate - ded)                                   # percentage points
+        from matplotlib.colors import LinearSegmentedColormap
+
+        cmap = LinearSegmentedColormap.from_list("div", [SERIES[1], SURFACE, SERIES[0]])
+        m = max(float(np.nanmax(np.abs(delta))), 0.1)
+        fig, ax = plt.subplots(figsize=(0.55 * L + 2.4, 0.42 * len(names) + 1.4))
+        im = ax.imshow(delta, aspect="auto", cmap=cmap, vmin=-m, vmax=m)
+        for v in range(len(names)):
+            for l in range(L):
+                if not np.isnan(delta[v, l]):
+                    ax.text(l, v, f"{delta[v, l]:+.1f}", ha="center", va="center", fontsize=6.5, color=INK)
+        ax.set_yticks(range(len(names)), names)
+        ax.set_xticks(range(L), ["in" if (l == 0 and elf0) else str(l) for l in layers])
+        ax.grid(False)
+        ax.set(xlabel="Layer", ylabel="Point",
+               title=f"Shared ({share}) - dedicated probes\nin-distribution test rate, percentage points")
+        ax.title.set_fontsize(9)
+        fig.colorbar(im, ax=ax, label="Difference (pp)", fraction=0.04)
+        save(fig, out, "shared_delta")
+
+
+def shared_summary(name, res, base):
+    names = variant_names(res["variants"])
+    L = res["layers_per_variant"]
+    elf0 = not trivial_layer0({"meta": res["meta"], "configs": {}})
+    cols = ["in" if (l == 0 and elf0) else str(l) for l in range(L)]
+    head = "| point | " + " | ".join(cols) + " |"
+    sep = "|---" * (L + 1) + "|"
+
+    def grid_rows(rate, lo=None, hi=None, fmt="{:.3f}"):
+        rows = []
+        for v, n in enumerate(names):
+            cells = []
+            for l in range(L):
+                if np.isnan(rate[v, l]):
+                    cells.append("–")
+                elif lo is None:
+                    cells.append(fmt.format(rate[v, l]))
+                else:
+                    cells.append(f"{rate[v, l]:.3f} [{lo[v, l]:.3f}, {hi[v, l]:.3f}]")
+            rows.append(f"| {n} | " + " | ".join(cells) + " |")
+        return rows
+
+    sp, share = res["splits"], res["share"]
+    lines = [f"## {name}: Shared probe ({share}) - {res['meta']['tag']} on {res['meta']['dataset']}", "",
+             f"{SHARE_TEXT[share]}. {len(res['probe_cells'])} probe(s), each trained on all (query, cell) pairs "
+             f"of its {len(res['probe_cells'][0])} cell(s); points: {', '.join(names)}. Same protocol and "
+             f"documents as the per-point runs: {len(sp['dev'])} dev / {len(sp['test_id'])} in-distribution "
+             f"test / {len(sp['test_ood'])} OOD test prompts; {len(res['pool'])} configurations, halving "
+             f"rounds {res['args']['rungs']} epochs, {len(res['finalists'])} finalists, "
+             f"{res['args']['cv_folds']}-fold CV; refit with {res['args']['seeds']} seeds. "
+             "Test rate [95% bootstrap CI over prompts]; row = point, column = layer.", "",
+             "Selected configuration per probe (CV mean validation rate over its cells, optimistic):", "",
+             "| probe | cells | config | CV val rate |", "|---|---|---|---|"]
+    for p, (cells, c, v) in enumerate(zip(res["probe_cells"], res["chosen"], res["chosen_cv_rate"])):
+        if share == "time":
+            what = f"layer {cols[res['cells'][cells[0]][1]]}, every point"
+        elif share == "layer":
+            what = f"point {names[res['cells'][cells[0]][0]]}, every layer"
+        elif share == "both":
+            what = "every point and layer"
+        else:
+            vv, ll = res["cells"][cells[0]]
+            what = f"point {names[vv]}, layer {cols[ll]}"
+        lines.append(f"| {p} | {what} | {c}: {describe_config(res['pool'][c])} | {v:.3f} |")
+    for test in ("id", "ood"):
+        if test not in res["test"]["selected"]:
+            continue
+        label = "in-distribution" if test == "id" else "OOD"
+        rate, lo, hi = _grid(res, "selected", test)
+        lines += ["", f"Shared probe, {label} test:", "", head, sep, *grid_rows(rate, lo, hi)]
+        ur, ul, uh = _grid(res, "selected", test, "unseen_types")
+        lines += ["", f"Shared probe, {label} test, unseen token types:", "", head, sep, *grid_rows(ur, ul, uh)]
+        ded = _base_grid(res, base, test)
+        if not np.isnan(ded).all():
+            lines += ["", f"Dedicated per-layer probes of each point (per-point runs), {label} test:", "", head,
+                      sep, *grid_rows(ded)]
+            lines += ["", f"Shared - dedicated, {label} test (percentage points):", "", head, sep,
+                      *grid_rows(100 * (rate - ded), fmt="{:+.2f}")]
+    for key in res["test"]:
+        if key != "selected" and "id" in res["test"][key]:
+            rate, _, _ = _grid(res, key, "id")
+            lines += ["", f"{key} (paper procedure, shared the same way), in-distribution test:", "", head, sep,
+                      *grid_rows(rate)]
+    if not base:
+        lines += ["", "No per-point selection.json found next to this run: no comparison with dedicated probes."]
+    return lines + [""]
+
+
 def describe_config(cfg):
     arch = cfg["arch"] if cfg["arch"] != "mlp" else f"mlp {cfg['depth']}x{cfg['width']}"
     extra = [f"lr {cfg['lr']:.1e}", f"wd {cfg['weight_decay']:g}", f"bs {cfg['batch_size']}"]
@@ -380,12 +551,15 @@ def table(res, configs, layers, key="test_mean"):
     return "\n".join(rows)
 
 
-def summary(results, out):
+def summary(results, out, baselines=None):
     lines = ["# Token identifiability results", "",
              "Mean ± std over folds of the test identifiability rate (fraction of tokens whose "
              "nearest same-sentence neighbour is the correct one). Column = layer "
              "(0 = input to the first block).", ""]
     for name, res in results.items():
+        if res["experiment"] == "selection" and is_shared(res):
+            lines += shared_summary(name, res, (baselines or {}).get(name, {}))
+            continue
         if res["experiment"] == "selection":
             lines += selection_summary(name, res)
             continue
@@ -430,7 +604,7 @@ def main(argv=None):
     for path in args.results:
         files = sorted(path.glob("*.json")) if path.is_dir() else [path]
         out = args.out or Path("figures") / (path.name if path.is_dir() else path.parent.name)
-        results = {}
+        results, baselines = {}, {}
         for f in files:
             res = load(f)
             results[f.stem] = res
@@ -439,13 +613,16 @@ def main(argv=None):
                 fig_identity(res, sub)
             elif res["experiment"] == "hidden2hidden":
                 fig_hidden2hidden(res, sub)
+            elif res["experiment"] == "selection" and is_shared(res):
+                baselines[f.stem] = load_baseline(res, f.parent.parent)  # results/<tag>_<dataset>/ next to it
+                fig_shared(res, sub, baselines[f.stem])
             elif res["experiment"] == "selection":
                 fig_selection(res, sub)
             else:
                 fig_neighbours(res, sub)
         if results:
             out.mkdir(parents=True, exist_ok=True)
-            summary(results, out)
+            summary(results, out, baselines)
             fig_generalization(results, out / "generalization")
             print(f"wrote {out} ({len(results)} result files)")
 

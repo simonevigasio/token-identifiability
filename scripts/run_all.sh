@@ -17,6 +17,10 @@
 #   MODELS="t5-small elf-xsum-inference" bash scripts/run_all.sh multidoc
 #                             (summarization ELF-B, 17 sources, prompts of 64-512 tokens: model
 #                              selection of g_l with a locked test set, tokid.selection)
+#   MODELS="elf-xsum-shared" bash scripts/run_all.sh multidoc
+#                             (probes shared across the 7 XSum trajectory points and/or the
+#                              layers: time-, layer-, and time+layer-independent; needs the
+#                              multidoc features of all 7 points)
 #   STAGE=extract|select|all  (multidoc only; default all. The ELF extraction writes all 7
 #                              trajectory points at once, so on Slurm run STAGE=extract first,
 #                              then the selection jobs; see slurm/run.sbatch)
@@ -52,7 +56,28 @@ run_exp() {  # features experiment out [args...]
 STAGE=${STAGE:-all}
 SEL_EXTRA=${SEL_EXTRA:-}
 
+run_shared() {  # elf-b-xsum_share-<time|layer|both>: one probe shared across points and/or layers
+  local model=$1 mode=${1##*_share-} res=results/${1}_multidoc feats=() p
+  [ "$STAGE" = extract ] && return   # uses the per-point features; nothing to extract
+  read -r -a points <<< "$ELF_XSUM_INFERENCE"   # in time order: t0 ... t0.9, decoder
+  for p in "${points[@]}"; do
+    if [ ! -f "features/${p}_multidoc.pt" ]; then
+      echo "missing features/${p}_multidoc.pt: run the multidoc extraction (STAGE=extract) first"; exit 1
+    fi
+    feats+=("features/${p}_multidoc.pt")
+  done
+  if [ -f "$res/selection.json" ]; then
+    echo "skip $res/selection.json"
+  else
+    $PY -m tokid.selection --features "${feats[@]}" --share "$mode" --tag "$model" --device "$DEVICE" \
+        --out "$res/selection.json" $SEL_EXTRA
+  fi
+  # compares with results/elf-b-xsum_<point>_multidoc/selection.json where those exist
+  $PY -m tokid.plots --results "$res" --out "figures/${model}_multidoc"
+}
+
 run_multidoc() {  # model: extraction (all ELF points at once) and/or model selection
+  if [[ $1 == elf-b-xsum_share-* ]]; then run_shared "$1"; return; fi
   local model=$1 feats=features/${1}_multidoc.pt res=results/${1}_multidoc done=features/${1}_multidoc.pt
   # The ELF extraction writes all 7 points and finishes with the decoder one.
   [[ $model == elf-b-xsum* ]] && done=features/elf-b-xsum_decoder_multidoc.pt

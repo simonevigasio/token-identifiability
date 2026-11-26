@@ -19,6 +19,12 @@
 #     MODELS="t5-small elf-xsum-inference" DATASETS=multidoc STAGE=select \
 #       sbatch --dependency=afterok:$jid --array=0-7 slurm/run.sbatch
 #       0=t5-small, 1=t=0, 2-6=t=0.1..0.9, 7=decoder
+#   Shared probes across the XSum trajectory (after the extraction above; the hidden states
+#   of all 7 points, ~26 GiB, are spread over the job's GPUs, so ask for 2):
+#     MODELS=elf-xsum-shared DATASETS=multidoc STAGE=select \
+#       sbatch --gres=gpu:2 --mem=48G --array=0-2 slurm/run.sbatch
+#       0=time-independent (one probe per layer), 1=layer-independent (one probe per point),
+#       2=both (one probe); each compares with the per-point runs' results
 #
 # AI-LAB allows at most 12 h per job. Shortly before the limit, the job requeues itself
 # (up to MAX_RESTARTS times). The experiments resume from their .partial checkpoints and
@@ -29,6 +35,9 @@
 #SBATCH --error=logs/tokid_%A_%a.err
 #SBATCH --open-mode=append
 #SBATCH --gres=gpu:1
+# The V100 nodes (compute capability 7.0) are too old for the container's PyTorch
+# (needs >= 7.5): jobs there fail with "no kernel image is available for execution".
+#SBATCH --exclude=nv-ai-02,nv-ai-03
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=24G
 #SBATCH --time=12:00:00

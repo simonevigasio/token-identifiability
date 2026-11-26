@@ -26,6 +26,20 @@ The paper's probes (linear / MLP-1000, cosine / L2, lr 1e-4, early stopping on t
 validation loss with patience 20) are trained on the same dev split and tested on the
 same documents, as a reference.
 
+Shared probes (``--share``, several ``--features`` files of the same prompts, e.g. the 7
+points of the ELF trajectory t0 ... decoder). A cell is one (file, layer) pair:
+  none   one probe per cell (the protocol above, run per file)
+  time   one probe per layer, trained on that layer of every file: time-independent
+  layer  one probe per file, trained on every layer of it: layer-independent
+  both   one probe for every cell: time- and layer-independent
+Everything above stays the same with "probe" in place of "layer": a probe's training set
+is every (query, cell) pair of its cells (an epoch passes over all of them), early
+stopping and CV selection use its validation rate averaged over its cells, halving
+promotes a configuration that ranks high for some probe, and input standardization
+uses the probe's pooled training data. Test rates are reported per cell. The splits
+are the per-file ones (same prompts, same seed), so the rates compare directly with
+the per-file runs.
+
 Search space (``sample_config``):
   arch          linear (no bias, paper) | affine (bias) | mlp (1-2 GELU layers, biases)
   width         512 | 1024 | 2048 (mlp)          dropout     0 | 0.1 | 0.2 (mlp)
@@ -76,18 +90,146 @@ def load_query_features(path, device):
     return feats
 
 
+# Probe sharing. A "cell" is one (variant, layer) pair: variant = one feature file, e.g.
+# one point of the ELF sampling trajectory (t0, t0.1, ..., decoder). Cell index:
+# variant * layers + layer. Every probe reads the cells of one row of ``probe_cells``.
+SHARE_MODES = ("none", "time", "layer", "both")
+
+
+def probe_cells(share: str, variants: int, layers: int) -> torch.Tensor:
+    """(P, K) cell indices read by each of the P probes.
+
+    none:  one probe per (variant, layer), P = V*L, K = 1 (the per-layer protocol);
+    time:  one probe per layer, shared by every variant (time-independent), P = L, K = V;
+    layer: one probe per variant, shared by every layer (layer-independent), P = V, K = L;
+    both:  a single probe for every cell, P = 1, K = V*L."""
+    grid = torch.arange(variants * layers).view(variants, layers)
+    if share == "none":
+        return grid.reshape(-1, 1)
+    if share == "time":
+        return grid.T.contiguous()
+    if share == "layer":
+        return grid.clone()
+    if share == "both":
+        return grid.reshape(1, -1)
+    raise ValueError(f"unknown share mode {share!r}")
+
+
+class CellStore:
+    """Hidden states of C cells, each (Q, d) float16, held in one or more shards (one per
+    device: the states of all 7 ELF trajectory points do not fit on one 24 GB GPU).
+
+    ``gather(c, q)``: (P, B, d) float16 on the main device; row (p, b) is the state of
+    query q[b] in cell c[p, b]."""
+
+    def __init__(self, shards, main):
+        """shards: list of (tensor (n_s, Q, d), the n_s cell ids it holds)."""
+        self.main = torch.device(main)
+        self.shards = [x for x, _ in shards]
+        C = sum(len(ids) for _, ids in shards)
+        shard_of, local = torch.full((C,), -1, dtype=torch.long), torch.zeros(C, dtype=torch.long)
+        for s, (_, ids) in enumerate(shards):
+            ids = torch.as_tensor(ids, dtype=torch.long)
+            shard_of[ids] = s
+            local[ids] = torch.arange(ids.numel())
+        if (shard_of < 0).any():
+            raise ValueError("every cell must be in exactly one shard")
+        self.shard_of, self.local = shard_of.to(self.main), local.to(self.main)
+        self.shape = (C, *self.shards[0].shape[1:])
+
+    def gather(self, c, q):
+        if len(self.shards) == 1:
+            x = self.shards[0]
+            return x[self.local[c].to(x.device), q.to(x.device)].to(self.main)
+        out = torch.empty(*c.shape, self.shape[2], dtype=self.shards[0].dtype, device=self.main)
+        which, qq = self.shard_of[c], q.expand_as(c)
+        for s, x in enumerate(self.shards):
+            m = which == s
+            if bool(m.any()):
+                out[m] = x[self.local[c[m]].to(x.device), qq[m].to(x.device)].to(self.main)
+        return out
+
+
+def _same_prompts(a, b):
+    keys = ("token_ids", "offsets", "query_index", "query_doc", "query_offsets", "doc_lengths", "embedding")
+    return a["domains"] == b["domains"] and all(torch.equal(a[k], b[k]) for k in keys)
+
+
+def load_cells(paths, device, reserve_gb: float = 4.0):
+    """Several multidoc feature files of the same prompts and queries (e.g. the 7 points
+    of the ELF trajectory) -> the features of the first, with ``hidden`` a CellStore of
+    all V*L cells (cell = variant * L + layer) and ``variant_meta`` the V metas.
+
+    On CUDA the cells fill the main GPU (keeping ``reserve_gb`` free for training) and
+    then the other visible GPUs. Cells are loaded one at a time: RAM never holds more
+    than one (Q, d) array."""
+    device = torch.device(device)
+    feats = [torch.load(p, map_location="cpu", weights_only=False) for p in paths]
+    for p, f in zip(paths, feats):
+        if f.get("format") != "queries":
+            raise ValueError(f"{p}: not a query-position feature file (extract with --dataset multidoc)")
+        if not _same_prompts(feats[0], f):
+            raise ValueError(f"{p}: different prompts or queries than {paths[0]}")
+    mms = [np.load(Path(p).with_name(f["meta"]["hidden_file"]), mmap_mode="r") for p, f in zip(paths, feats)]
+    if len({m.shape for m in mms}) != 1:
+        raise ValueError(f"hidden shapes differ: {[m.shape for m in mms]}")
+    L, Q, d = mms[0].shape
+    C, cell_bytes = len(mms) * L, Q * d * 2
+    if device.type == "cuda":
+        main = torch.device("cuda", device.index if device.index is not None else torch.cuda.current_device())
+        devices = [main] + [torch.device("cuda", i) for i in range(torch.cuda.device_count()) if i != main.index]
+        caps = []
+        for dv in devices:
+            free, _ = torch.cuda.mem_get_info(dv)
+            keep = (reserve_gb if dv == main else 0.5) * 2**30
+            caps.append(max(0, int((free - keep) // cell_bytes)))
+        if sum(caps) < C:
+            raise SystemExit(f"the hidden states need {C * cell_bytes / 2**30:.1f} GiB ({C} cells); the "
+                             f"{len(devices)} visible GPU(s) hold {sum(caps)} cells. Request more GPUs "
+                             f"(e.g. sbatch --gres=gpu:2 --mem=48G) or lower --reserve-gb.")
+    else:
+        main, devices, caps = device, [device], [C]
+    shards, nxt = [], 0
+    for dv, cap in zip(devices, caps):
+        ids = list(range(nxt, min(C, nxt + cap)))
+        if not ids:
+            continue
+        x = torch.empty(len(ids), Q, d, dtype=torch.float16, device=dv)
+        for j, c in enumerate(ids):
+            x[j] = torch.from_numpy(np.array(mms[c // L][c % L])).to(dv)
+        shards.append((x, ids))
+        nxt += len(ids)
+    out = feats[0]
+    out["hidden"] = CellStore(shards, main)
+    out["variant_meta"] = [f["meta"] for f in feats]
+    out["shard_cells"] = [(str(x.device), len(ids)) for x, ids in shards]
+    return out
+
+
 class QueryData:
     """Queries (stored positions) and candidates (every distinct token of the prompt).
 
     A query is identified if the nearest candidate of its own prompt is its token. Two
     occurrences of a token have the same T5 embedding, so candidates are the distinct
     token ids of the prompt: retrieving either occurrence counts as correct, as in
-    tokid.identify."""
+    tokid.identify.
 
-    def __init__(self, feats, device):
+    ``cells`` (P, K): probe p reads cells[p] (see probe_cells). Its training set is every
+    (query, cell) pair of its K cells. Default: one probe per cell (P = C, K = 1)."""
+
+    def __init__(self, feats, device, cells=None):
         self.device = device
-        self.x = feats["hidden"]                                         # (G, Q, d) float16
-        self.layers = self.x.shape[0]
+        x = feats["hidden"]                                              # (C, Q, d) float16
+        self.x = x if isinstance(x, CellStore) else CellStore([(x, list(range(x.shape[0])))], device)
+        self.num_cells = self.x.shape[0]
+        cells = torch.arange(self.num_cells)[:, None] if cells is None else torch.as_tensor(cells, dtype=torch.long)
+        if not torch.equal(cells.flatten().sort().values, torch.arange(self.num_cells)):
+            raise ValueError("every cell must be read by exactly one probe")
+        self.cells = cells.to(device)
+        self.probes, self.share_k = cells.shape
+        probe_of = torch.empty(self.num_cells, dtype=torch.long)
+        probe_of[cells.flatten()] = torch.arange(self.probes).repeat_interleave(self.share_k)
+        self.probe_of = probe_of.tolist()
         tok = feats["token_ids"]
         self.q_tok = tok[feats["query_index"]].to(device)
         self.q_doc = feats["query_doc"].to(device)
@@ -120,8 +262,18 @@ class QueryData:
         docs = np.asarray(docs, dtype=np.int64)
         return torch.cat([torch.arange(int(self.q_off[d]), int(self.q_off[d + 1])) for d in docs]).to(self.device)
 
-    def inputs(self, idx):
-        return self.x[:, idx].float()
+    def inputs(self, k, idx):
+        """(P, B, d) float32: for each probe p, query idx[b] in its cell cells[p, k[b]]
+        (``k`` a (B,) tensor, or an int: the same slot for every query)."""
+        if torch.is_tensor(k):
+            c = self.cells[:, k]
+        else:
+            c = self.cells[:, k:k + 1].expand(-1, idx.numel())
+        return self.x.gather(c, idx).float()
+
+    def per_probe(self, v):
+        """Per-cell values (C, ...) -> per-probe means over the probe's cells (P, ...)."""
+        return v[self.cells].mean(1)
 
     def targets(self, idx):
         return self.E[self.q_tok[idx]][None]
@@ -134,33 +286,40 @@ class QueryData:
 
     @torch.no_grad()
     def correct(self, model, docs, metric, chunk_docs: int = 16):
-        """Bool (G, queries of ``docs`` in order): nearest same-prompt candidate is right."""
+        """Bool (C, queries of ``docs`` in order), per cell: nearest same-prompt candidate
+        is right (cell c evaluated with the probe that reads it)."""
         out = []
         docs = np.asarray(docs, dtype=np.int64)
         for i in range(0, docs.size, chunk_docs):
             chunk = docs[i:i + chunk_docs]
             idx = self.queries(chunk)
-            pred = model(self.inputs(idx))                               # (G, n, d_tok)
             c = torch.cat([torch.arange(int(self.c_off[d]), int(self.c_off[d + 1])) for d in chunk]).to(self.device)
             cand = self.E[self.c_tok[c]]
-            if metric == "cos":
-                score = F.normalize(pred, dim=-1) @ F.normalize(cand, dim=-1).T
-            elif metric == "l2":
-                score = -torch.cdist(pred, cand[None].expand(pred.shape[0], -1, -1).contiguous(),
-                                     compute_mode="donot_use_mm_for_euclid_dist")
-            else:
-                raise ValueError(metric)
-            score = score.masked_fill(self.q_doc[idx][:, None] != self.c_doc[c][None, :], float("-inf"))
-            out.append(self.c_tok[c][score.argmax(-1)] == self.q_tok[idx])
+            other_doc = self.q_doc[idx][:, None] != self.c_doc[c][None, :]
+            ok = torch.empty(self.num_cells, idx.numel(), dtype=torch.bool, device=self.device)
+            for k in range(self.share_k):
+                pred = model(self.inputs(k, idx))                        # (P, n, d_tok)
+                if metric == "cos":
+                    score = F.normalize(pred, dim=-1) @ F.normalize(cand, dim=-1).T
+                elif metric == "l2":
+                    score = -torch.cdist(pred, cand[None].expand(pred.shape[0], -1, -1).contiguous(),
+                                         compute_mode="donot_use_mm_for_euclid_dist")
+                else:
+                    raise ValueError(metric)
+                score = score.masked_fill(other_doc, float("-inf"))
+                ok[self.cells[:, k]] = self.c_tok[c][score.argmax(-1)] == self.q_tok[idx]
+            out.append(ok)
         return torch.cat(out, dim=1)
 
     @torch.no_grad()
     def mean_loss(self, model, idx, cfg, chunk: int = 4096):
-        total = torch.zeros(self.layers, device=self.device)
-        for i in range(0, idx.numel(), chunk):
-            b = idx[i:i + chunk]
-            total += self.loss(model(self.inputs(b)), b, cfg) * b.numel()
-        return total / idx.numel()
+        """(P,) mean loss of each probe over all (query, cell) pairs of its cells."""
+        total = torch.zeros(self.probes, device=self.device)
+        for k in range(self.share_k):
+            for i in range(0, idx.numel(), chunk):
+                b = idx[i:i + chunk]
+                total += self.loss(model(self.inputs(k, b)), b, cfg) * b.numel()
+        return total / (self.share_k * idx.numel())
 
 
 class Identity(torch.nn.Module):
@@ -231,33 +390,41 @@ def metric_of(cfg):
 
 
 def build_probe(cfg, data, train_idx, seed):
+    """The P probes of a configuration. Input standardization uses each probe's own
+    training data: all (query, cell) pairs of its cells (a shared probe gets pooled
+    statistics, so no cell-specific scaling enters it)."""
     mean = std = None
     if cfg["standardize"]:
-        s1 = torch.zeros(data.layers, data.x.shape[-1], dtype=torch.float64, device=data.device)
+        s1 = torch.zeros(data.probes, data.x.shape[-1], dtype=torch.float64, device=data.device)
         s2 = torch.zeros_like(s1)
-        for i in range(0, train_idx.numel(), 16384):
-            x = data.inputs(train_idx[i:i + 16384]).double()
-            s1 += x.sum(1)
-            s2 += (x * x).sum(1)
-        mean = s1 / train_idx.numel()
-        std = (s2 / train_idx.numel() - mean * mean).clamp_min(0).sqrt()
+        for k in range(data.share_k):
+            for i in range(0, train_idx.numel(), 16384):
+                x = data.inputs(k, train_idx[i:i + 16384]).double()
+                s1 += x.sum(1)
+                s2 += (x * x).sum(1)
+        n = data.share_k * train_idx.numel()
+        mean = s1 / n
+        std = (s2 / n - mean * mean).clamp_min(0).sqrt()
     gen = torch.Generator().manual_seed(seed)
-    return BatchedProbe(data.layers, data.x.shape[-1], data.E.shape[-1], hidden=(cfg["width"],) * cfg["depth"],
+    return BatchedProbe(data.probes, data.x.shape[-1], data.E.shape[-1], hidden=(cfg["width"],) * cfg["depth"],
                         bias=cfg["arch"] != "linear", dropout=cfg["dropout"], mean=mean, std=std,
                         generator=gen).to(data.device)
 
 
 def train(cfg, data, train_docs, val_docs=None, seed=0, max_epochs=200, patience=10, stop_on="rate",
           epochs_per_layer=None, log=""):
-    """Train the G probes of one configuration.
+    """Train the P probes of one configuration (one per layer in the per-layer protocol).
 
-    With ``val_docs``: per-layer early stopping on the validation identifiability rate
-    (``stop_on="rate"``) or loss (``"loss"``, the paper); each layer keeps its best
-    epoch's weights. With ``epochs_per_layer`` (refit, no validation): layer l keeps its
-    weights after epochs_per_layer[l] epochs."""
-    G, dev = data.layers, data.device
+    An epoch is one pass over the probe's training set: every (training query, cell)
+    pair of its K cells, in a random order shared by all probes. With ``val_docs``:
+    per-probe early stopping on the validation identifiability rate, averaged over the
+    probe's cells (``stop_on="rate"``), or loss (``"loss"``, the paper); each probe keeps
+    its best epoch's weights. With ``epochs_per_layer`` (refit, no validation): probe p
+    keeps its weights after epochs_per_layer[p] epochs."""
+    G, dev = data.probes, data.device
     torch.manual_seed(seed)  # dropout draws from the global generator: every unit reproducible on its own
     tr = data.queries(train_docs)
+    n_tr = tr.numel()
     model = build_probe(cfg, data, tr, seed)
     params = list(model.parameters())
     opt = torch.optim.AdamW(params, lr=cfg["lr"], betas=(0.9, 0.999), weight_decay=cfg["weight_decay"])
@@ -273,10 +440,12 @@ def train(cfg, data, train_docs, val_docs=None, seed=0, max_epochs=200, patience
     bs, t0, epoch = cfg["batch_size"], time.time(), -1
     for epoch in range(max_epochs):
         model.train()
-        perm = tr[torch.randperm(tr.numel(), generator=gen).to(dev)]
+        # pair j = (slot j // n_tr, query tr[j % n_tr]); with K = 1 this is a plain permutation of tr
+        perm = torch.randperm(data.share_k * n_tr, generator=gen).to(dev)
         for i in range(0, perm.numel(), bs):
-            b = perm[i:i + bs]
-            loss = data.loss(model(data.inputs(b)), b, cfg).sum()
+            j = perm[i:i + bs]
+            b = tr[j % n_tr]
+            loss = data.loss(model(data.inputs(j // n_tr, b)), b, cfg).sum()
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -285,7 +454,7 @@ def train(cfg, data, train_docs, val_docs=None, seed=0, max_epochs=200, patience
             take = target == epoch + 1
         else:
             if stop_on == "rate":
-                score = data.correct(model, val_docs, metric_of(cfg)).float().mean(-1)
+                score = data.per_probe(data.correct(model, val_docs, metric_of(cfg)).float().mean(-1))
             else:
                 score = -data.mean_loss(model, va, cfg)
             take = (score > best) & active
@@ -333,7 +502,7 @@ def doc_counts(data, model, docs, metric, seen_types):
     unseen = ~torch.isin(data.q_tok[idx], seen_types)
     pos = {int(d): i for i, d in enumerate(docs)}
     col = torch.tensor([pos[int(d)] for d in q_doc.tolist()], device=data.device)
-    D, G = len(docs), data.layers
+    D, G = len(docs), data.num_cells
 
     def per_doc(mask):
         c = torch.zeros(G, D, device=data.device).index_add_(1, col[mask], ok[:, mask].float())
@@ -382,7 +551,8 @@ def mean_counts(runs):
 
 
 def per_layer_counts(chosen, counts_by_cfg):
-    """Counts of the selected probe: layer l from configuration chosen[l]."""
+    """Counts of the selected probes: cell l from configuration chosen[l] (the
+    configuration chosen for the probe that reads cell l)."""
     out = {}
     for k in ("correct", "correct_unseen"):
         out[k] = [counts_by_cfg[c][k][l] for l, c in enumerate(chosen)]
@@ -394,7 +564,11 @@ def per_layer_counts(chosen, counts_by_cfg):
 # ---------------------------------------------------------------------------- protocol
 
 def run(data, splits, args, ckpt, rng_seed):
-    G = data.layers
+    """The protocol with one *probe* as the unit of every choice: halving promotes a
+    configuration that ranks high for some probe, each probe picks its own configuration
+    by CV, and gets its own refit epochs. Per-layer protocol: probe = layer. Rates are
+    reported per cell, each from the probe that reads it."""
+    G = data.probes
     rng = np.random.default_rng([args.seed, 11])
     pool = dict(PAPER_CONFIGS)
     pool.update({f"r{i:02d}": sample_config(rng) for i in range(args.n_random)})
@@ -471,10 +645,11 @@ def run(data, splits, args, ckpt, rng_seed):
 
     rng_b = np.random.default_rng([rng_seed, 13])
     selected = {}
+    chosen_per_cell = [chosen[p] for p in data.probe_of]
     for name, docs in test_sets.items():
         if docs:
-            selected[name] = summarize(per_layer_counts(chosen, {c: counts[c][name] for c in counts}), data, docs,
-                                       rng_b, args.bootstrap)
+            selected[name] = summarize(per_layer_counts(chosen_per_cell, {c: counts[c][name] for c in counts}), data,
+                                       docs, rng_b, args.bootstrap)
     res["test"]["selected"] = selected
     for prefix in ("paper/", "naive/"):
         for key, val in ckpt.units.items():
@@ -488,7 +663,17 @@ def main(argv=None):
     from tokid.experiments import Checkpoint
 
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--features", type=Path, required=True, help="features/<tag>_multidoc.pt")
+    p.add_argument("--features", type=Path, nargs="+", required=True,
+                   help="features/<tag>_multidoc.pt. Several files of the same prompts (e.g. the 7 points of the "
+                        "ELF trajectory, in time order) for --share.")
+    p.add_argument("--share", choices=SHARE_MODES, default="none",
+                   help="none: one probe per (file, layer); time: one probe per layer for all files "
+                        "(time-independent); layer: one probe per file for all layers (layer-independent); "
+                        "both: one probe for everything.")
+    p.add_argument("--tag", default=None, help="Run name with several files (default <common prefix>_share-<mode>).")
+    p.add_argument("--reserve-gb", type=float, default=4.0,
+                   help="GPU memory kept free on the main GPU for training; the hidden states fill the rest and "
+                        "then the other visible GPUs.")
     p.add_argument("--n-random", type=int, default=48, help="Random configurations (plus the 4 paper probes).")
     p.add_argument("--rungs", type=int, nargs="+", default=[5, 20], help="Epoch budget of each halving round.")
     p.add_argument("--eta", type=int, default=3, help="Keep 1/eta of the configurations after each round.")
@@ -505,26 +690,43 @@ def main(argv=None):
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args(argv)
 
-    out = args.out or Path("results") / args.features.stem / "selection.json"
-    if out.exists() and not args.overwrite:
-        p.error(f"{out} exists (use --overwrite)")
-    out.parent.mkdir(parents=True, exist_ok=True)
+    multi = len(args.features) > 1 or args.share != "none"
     device = resolve_device(args.device)
     if device.type == "cuda":  # probes only (features are fixed): TF32 matmuls, ~3x faster
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     torch.manual_seed(args.seed)
-    feats = load_query_features(args.features, device)
-    meta = feats["meta"]
-    data = QueryData(feats, device)
+    feats = load_cells(args.features, device, args.reserve_gb)
+    metas = feats["variant_meta"]
+    meta = dict(feats["meta"])
+    V, L = len(metas), feats["hidden"].shape[0] // len(metas)
+    if multi:
+        tags = [m["tag"] for m in metas]
+        prefix = os.path.commonprefix(tags)
+        prefix = prefix[:prefix.rfind("_")] if "_" in prefix else prefix
+        meta.update(tag=args.tag or f"{prefix or 'multi'}_share-{args.share}", variants=tags, share=args.share,
+                    layers_per_variant=L, hidden_file=[m["hidden_file"] for m in metas])
+    out = args.out or Path("results") / (f"{meta['tag']}_{meta['dataset']}" if multi else args.features[0].stem) \
+        / "selection.json"
+    if out.exists() and not args.overwrite:
+        p.error(f"{out} exists (use --overwrite)")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cells = probe_cells(args.share, V, L)
+    data = QueryData(feats, device, cells)
     splits = protocol_splits(feats["domains"], feats["doc_lengths"].tolist(), meta["ood_domains"],
                              cv_folds=args.cv_folds, seed=args.seed)
+    shards = feats["shard_cells"]
     del feats
     print(f"[selection] {meta['tag']} / {meta['dataset']}: {data.num_docs} prompts, {data.x.shape[1]} queries, "
-          f"hidden {tuple(data.x.shape)}; dev {len(splits['dev'])} / test id {len(splits['test_id'])} / "
-          f"test ood {len(splits['test_ood'])} prompts; device={device}", flush=True)
-    settings = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()
-                if k not in ("device", "out", "overwrite")}
+          f"hidden {tuple(data.x.shape)} ({V} file(s) x {L} layers; cells per device {shards}); "
+          f"share={args.share}: {data.probes} probe(s) x {data.share_k} cell(s); dev {len(splits['dev'])} / "
+          f"test id {len(splits['test_id'])} / test ood {len(splits['test_ood'])} prompts; device={device}",
+          flush=True)
+    # Settings of a single-file per-layer run are unchanged, so its old checkpoints still resume.
+    settings = {k: v for k, v in vars(args).items() if k not in ("device", "out", "overwrite", "tag", "reserve_gb")}
+    settings["features"] = [str(f) for f in args.features] if multi else str(args.features[0])
+    if not multi:
+        settings.pop("share")
     partial = out.with_name(out.name + ".partial")
     if args.overwrite and partial.exists():
         partial.unlink()
@@ -532,7 +734,10 @@ def main(argv=None):
     t0 = time.time()
     res = run(data, splits, args, ckpt, args.seed)
     result = {"meta": meta, "experiment": "selection", "args": settings, "splits": splits,
-              "layers": list(range(data.layers)), "elapsed_s": time.time() - t0, **res}
+              "layers": list(range(data.num_cells)), "elapsed_s": time.time() - t0, **res}
+    if multi:
+        result.update(share=args.share, variants=meta["variants"], layers_per_variant=L,
+                      cells=[[c // L, c % L] for c in range(data.num_cells)], probe_cells=cells.tolist())
     tmp = out.with_name(out.name + ".tmp")
     tmp.write_text(json.dumps(result))
     os.replace(tmp, out)
