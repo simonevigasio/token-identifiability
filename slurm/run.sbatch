@@ -28,7 +28,8 @@
 #       each compares with the per-point runs' results. On AI Cloud, 6-day jobs on the
 #       prioritized partition need far fewer restarts (command-line options override #SBATCH):
 #     MAX_RESTARTS=5 MODELS=elf-xsum-shared DATASETS=multidoc STAGE=select \
-#       sbatch -p prioritized --time=6-00:00:00 --gres=gpu:2 --mem=48G --array=0-1 slurm/run.sbatch
+#       sbatch -p prioritized --time=6-00:00:00 --gres=gpu:2 --mem=48G --array=0-1 \
+#       --exclude=nv-ai-02,nv-ai-03,a256-t4-01,a256-t4-02,a256-t4-03 slurm/run.sbatch
 #
 # AI-LAB allows at most 12 h per job. Shortly before the limit, the job requeues itself
 # (up to MAX_RESTARTS times). The experiments resume from their .partial checkpoints and

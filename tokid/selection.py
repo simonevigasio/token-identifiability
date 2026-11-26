@@ -155,14 +155,15 @@ def _same_prompts(a, b):
     return a["domains"] == b["domains"] and all(torch.equal(a[k], b[k]) for k in keys)
 
 
-def load_cells(paths, device, reserve_gb: float = 4.0):
+def load_cells(paths, device, reserve_gb: float = 6.0):
     """Several multidoc feature files of the same prompts and queries (e.g. the 7 points
     of the ELF trajectory) -> the features of the first, with ``hidden`` a CellStore of
     all V*L cells (cell = variant * L + layer) and ``variant_meta`` the V metas.
 
-    On CUDA the cells fill the main GPU (keeping ``reserve_gb`` free for training) and
-    then the other visible GPUs. Cells are loaded one at a time: RAM never holds more
-    than one (Q, d) array."""
+    On CUDA the cells fill the other visible GPUs first and the main GPU, where the
+    probes train, only with what is left, keeping ``reserve_gb`` free there (training
+    peaks at a few GiB, e.g. the standardization pass). Cells are loaded one at a time:
+    RAM never holds more than one (Q, d) array."""
     device = torch.device(device)
     feats = [torch.load(p, map_location="cpu", weights_only=False) for p in paths]
     for p, f in zip(paths, feats):
@@ -177,7 +178,7 @@ def load_cells(paths, device, reserve_gb: float = 4.0):
     C, cell_bytes = len(mms) * L, Q * d * 2
     if device.type == "cuda":
         main = torch.device("cuda", device.index if device.index is not None else torch.cuda.current_device())
-        devices = [main] + [torch.device("cuda", i) for i in range(torch.cuda.device_count()) if i != main.index]
+        devices = [torch.device("cuda", i) for i in range(torch.cuda.device_count()) if i != main.index] + [main]
         caps = []
         for dv in devices:
             free, _ = torch.cuda.mem_get_info(dv)
@@ -185,8 +186,10 @@ def load_cells(paths, device, reserve_gb: float = 4.0):
             caps.append(max(0, int((free - keep) // cell_bytes)))
         if sum(caps) < C:
             raise SystemExit(f"the hidden states need {C * cell_bytes / 2**30:.1f} GiB ({C} cells); the "
-                             f"{len(devices)} visible GPU(s) hold {sum(caps)} cells. Request more GPUs "
-                             f"(e.g. sbatch --gres=gpu:2 --mem=48G) or lower --reserve-gb.")
+                             f"{len(devices)} visible GPU(s) "
+                             f"({', '.join(torch.cuda.get_device_name(dv) for dv in devices)}) hold {sum(caps)} "
+                             f"cells. Request more GPUs (sbatch --gres=gpu:{len(devices) + 1}), GPUs with more "
+                             f"memory (e.g. exclude the T4 nodes), or lower --reserve-gb.")
     else:
         main, devices, caps = device, [device], [C]
     shards, nxt = [], 0
@@ -740,9 +743,9 @@ def main(argv=None):
                         "(time-independent); layer: one probe per file for all layers (layer-independent); "
                         "both: one probe for everything.")
     p.add_argument("--tag", default=None, help="Run name with several files (default <common prefix>_share-<mode>).")
-    p.add_argument("--reserve-gb", type=float, default=4.0,
-                   help="GPU memory kept free on the main GPU for training; the hidden states fill the rest and "
-                        "then the other visible GPUs.")
+    p.add_argument("--reserve-gb", type=float, default=6.0,
+                   help="GPU memory kept free for training on the main GPU; the hidden states fill the other "
+                        "visible GPUs first and the main GPU only with what is left.")
     p.add_argument("--n-random", type=int, default=48, help="Random configurations (plus the 4 paper probes).")
     p.add_argument("--rungs", type=int, nargs="+", default=[5, 20], help="Epoch budget of each halving round.")
     p.add_argument("--eta", type=int, default=3, help="Keep 1/eta of the configurations after each round.")

@@ -217,7 +217,8 @@ token in the *same form* across those points or layers, not just *somewhere*. A 
   (`tests/test_selection.py`). Give the jobs enough restarts (`MAX_RESTARTS`, below).
 * **Memory.** The hidden states
   of all 7 points (~26 GiB float16) do not fit on one 24 GB GPU. They are spread over all of
-  the job's GPUs (`CellStore`), keeping `--reserve-gb` (default 4) free on the first GPU, so
+  the job's GPUs (`CellStore`): the other GPUs first, then the training GPU, keeping
+  `--reserve-gb` (default 6) free there for training, so
   the Slurm jobs ask for 2 GPUs. With `--share none` and one features file, the code is the
   per-layer protocol, unchanged: `tests/test_selection.py` covers both.
 
@@ -274,9 +275,12 @@ MODELS="t5-small elf-xsum-inference" DATASETS=multidoc STAGE=select \
 #    2 GPUs because the hidden states of all 7 points (~26 GiB) are spread over them:
 MAX_RESTARTS=30 MODELS=elf-xsum-shared DATASETS=multidoc STAGE=select \
   sbatch --gres=gpu:2 --mem=48G --array=0-1 slurm/run.sbatch
-#    ... or on AI Cloud, 6-day jobs on the prioritized partition (far fewer restarts):
+#    ... or on AI Cloud, 6-day jobs on the prioritized partition (far fewer restarts); not on
+#    the T4 nodes, whose 2 x 16 GB cannot hold the ~26 GiB (the command-line --exclude
+#    replaces the script's, so the V100 nodes are listed again):
 MAX_RESTARTS=5 MODELS=elf-xsum-shared DATASETS=multidoc STAGE=select \
-  sbatch -p prioritized --time=6-00:00:00 --gres=gpu:2 --mem=48G --array=0-1 slurm/run.sbatch
+  sbatch -p prioritized --time=6-00:00:00 --gres=gpu:2 --mem=48G --array=0-1 \
+    --exclude=nv-ai-02,nv-ai-03,a256-t4-01,a256-t4-02,a256-t4-03 slurm/run.sbatch
 
 # 3. monitor
 squeue --me
