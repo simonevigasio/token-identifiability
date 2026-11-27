@@ -470,3 +470,131 @@ def test_retest_adds_vocab_scores_and_reproduces_the_run(tmp_path):
         "selected"]["id"]
     assert not list(out.parent.glob("*.partial")) and not list(out.parent.glob("*.unit.pt"))
     selection.main(["--features", str(path), "--out", str(out), "--retest", *TINY])   # nothing left to do
+
+
+# ------------------------------------------------------------ whole-vocabulary objective
+
+@pytest.mark.parametrize("chunk", [3, 1000])
+def test_info_nce_vocab_matches_full_cross_entropy(chunk):
+    """The chunked loss equals a plain softmax over every embedding row, values and gradients."""
+    from tokid.probes import info_nce_vocab_loss
+
+    torch.manual_seed(0)
+    E = torch.randn(50, 8, dtype=torch.float64)
+    En = F.normalize(E, dim=-1)
+    target = torch.randint(0, 50, (7,))
+    pred = torch.randn(3, 7, 8, dtype=torch.float64, requires_grad=True)
+    w = torch.tensor([1.0, 2.0, 0.5], dtype=torch.float64)          # different weight per layer
+    got = info_nce_vocab_loss(pred, En, target, 0.07, chunk=chunk)
+    (got * w).sum().backward()
+    g_got = pred.grad.clone()
+    pred.grad = None
+    logits = torch.einsum("gbd,vd->gbv", F.normalize(pred, dim=-1), En) / 0.07
+    ref = F.cross_entropy(logits.flatten(0, 1), target.repeat(3), reduction="none").view(3, -1).mean(-1)
+    (ref * w).sum().backward()
+    assert torch.allclose(got, ref, atol=1e-12) and torch.allclose(g_got, pred.grad, atol=1e-12)
+    with torch.no_grad():   # evaluation: same value, no gradient work
+        assert torch.allclose(info_nce_vocab_loss(pred, En, target, 0.07, chunk=chunk), ref, atol=1e-12)
+
+
+def test_vocab_objective_draws_the_same_configurations():
+    ra, rb = np.random.default_rng([0, 11]), np.random.default_rng([0, 11])
+    a = [selection.sample_config(ra) for _ in range(200)]
+    b = [selection.sample_config(rb, "vocab") for _ in range(200)]
+    assert any(x["loss"] == "infonce" for x in a)
+    for x, y in zip(a, b):
+        assert {**x, "loss": "infonce_vocab" if x["loss"] == "infonce" else x["loss"]} == y
+
+
+class Stack(torch.nn.Module):
+    """Single-probe models from load_selected, as one P-probe model for QueryData."""
+
+    def __init__(self, entries):
+        super().__init__()
+        self.ms = torch.nn.ModuleList([e["model"] for e in entries])
+
+    def forward(self, x):
+        return torch.cat([m(x[p:p + 1]) for p, m in enumerate(self.ms)])
+
+
+def reloaded_vocab_rate(data, root, seeds, docs):
+    """Vocabulary-wide top-1 test rate per cell from the saved weights, mean over seeds."""
+    rates = []
+    for s in range(seeds):
+        entries = selection.load_selected(root, seed=s)
+        stack = Stack(entries)
+        rate = torch.empty(data.num_cells, dtype=torch.float64)
+        for e in entries:
+            hits = data.vocab_correct(stack, docs, e["metric"], ks=(1,))[1]
+            for c in e["cells"]:
+                rate[c] = hits[c].double().mean()
+        rates.append(rate)
+    return torch.stack(rates).mean(0)
+
+
+def test_vocab_selection_end_to_end_and_saved_weights(tmp_path):
+    path = write_features(tmp_path)
+    out = tmp_path / "res_vocab" / "selection.json"
+    selection.main(["--features", str(path), "--out", str(out), "--objective", "vocab", *TINY])
+    r = json.loads(out.read_text())
+    assert r["objective"] == "vocab" and r["args"]["objective"] == "vocab"
+    assert all(c["loss"] in ("cos", "l2", "infonce_vocab") for c in r["pool"].values())
+    # the halving scores are vocabulary-wide rates: at most the same-prompt rate, never above 1
+    assert all(0 <= v <= 1 for rung in r["rungs"] for u in rung.values() for v in u["val"])
+    sel = r["test"]["selected"]["id"]
+    assert "vocab_top1" in sel and "all" in sel
+    # weights: one file per chosen configuration and seed, together covering every probe
+    files = r["weights"]["files"]
+    assert set(files) == set(r["chosen"]) and all(len(v) == 2 and None not in v for v in files.values())
+    entries = selection.load_selected(out.parent, seed=1)
+    assert [e["probe"] for e in entries] == list(range(4))
+    assert [e["config_name"] for e in entries] == r["chosen"]
+    assert all(e["epochs"] == r["final_epochs"][e["config_name"]][e["probe"]] for e in entries)
+    # the reloaded probes give exactly the reported test rates
+    data = selection.QueryData(selection.load_query_features(path, torch.device("cpu")), torch.device("cpu"))
+    got = reloaded_vocab_rate(data, out.parent, 2, r["splits"]["test_id"])
+    assert np.allclose(got.numpy(), sel["vocab_top1"]["rate"], atol=1e-9)
+
+
+def test_prompt_objective_saves_weights_and_keeps_its_settings(tmp_path):
+    path = write_features(tmp_path)
+    out = tmp_path / "res" / "selection.json"
+    selection.main(["--features", str(path), "--out", str(out), *TINY])
+    r = json.loads(out.read_text())
+    assert r["objective"] == "prompt" and "objective" not in r["args"]   # old runs and checkpoints still match
+    assert all(c["loss"] != "infonce_vocab" for c in r["pool"].values())
+    data = selection.QueryData(selection.load_query_features(path, torch.device("cpu")), torch.device("cpu"))
+    got = reloaded_vocab_rate(data, out.parent, 2, r["splits"]["test_ood"])
+    assert np.allclose(got.numpy(), r["test"]["selected"]["ood"]["vocab_top1"]["rate"], atol=1e-9)
+
+
+def test_vocab_share_time_compares_with_vocab_per_point_runs(tmp_path):
+    from tokid import plots
+
+    paths = write_variants(tmp_path)
+    root = tmp_path / "results"
+    for p in paths:
+        selection.main(["--features", str(p), "--out", str(root / f"{p.stem}_vocab" / "selection.json"),
+                        "--objective", "vocab", *TINY])
+    selection.main(["--features", str(paths[0]), "--out", str(root / paths[0].stem / "selection.json"), *TINY])
+    out = root / "fake_share-time_multidoc_vocab" / "selection.json"
+    selection.main(["--features", *map(str, paths), "--share", "time", "--objective", "vocab",
+                    "--out", str(out), *TINY])
+    r = json.loads(out.read_text())
+    assert r["objective"] == "vocab" and len(r["chosen"]) == 4
+    entries = selection.load_selected(out.parent, seed=0)
+    assert [len(e["cells"]) for e in entries] == [2] * 4            # one probe per layer, both points
+    assert entries[1]["cell_names"] == ["fake_t0/layer1", "fake_t1/layer1"]
+    data = selection.QueryData(selection.load_cells(paths, torch.device("cpu")), torch.device("cpu"),
+                               selection.probe_cells("time", 2, 4))
+    got = reloaded_vocab_rate(data, out.parent, 2, r["splits"]["test_id"])
+    assert np.allclose(got.numpy(), r["test"]["selected"]["id"]["vocab_top1"]["rate"], atol=1e-9)
+
+    plots.main(["--results", str(out.parent), "--out", str(tmp_path / "fig")])
+    text = (tmp_path / "fig" / "summary.md").read_text()
+    assert "Training objective: the whole vocabulary" in text
+    assert "Shared - dedicated" in text   # found the _vocab per-point runs, not the prompt-objective one
+    plots.main(["--results", str(root / f"{paths[0].stem}_vocab"), "--out", str(tmp_path / "fig1")])
+    text = (tmp_path / "fig1" / "summary.md").read_text()
+    assert "Whole-vocabulary training vs the probes selected with the paper's objective" in text
+    assert (tmp_path / "fig1" / "selection" / "selection_vocab.png").is_file()

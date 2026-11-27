@@ -53,6 +53,23 @@ Search space (``sample_config``):
   batch size    256 | 1024
 The nearest-neighbour metric of a probe is cosine for cos / infonce and L2 for l2.
 
+Objective (``--objective``):
+  prompt  (default, the paper's task) a probe is right if the nearest of its prompt's own
+          distinct tokens is the true one; early stopping, halving and CV selection use
+          this validation rate, and the contrastive loss is a softmax over those tokens.
+  vocab   the task is the whole vocabulary: early stopping, halving and CV selection use
+          the vocabulary-wide validation top-1 (true token nearest among every row of the
+          embedding matrix), and the contrastive loss becomes ``infonce_vocab``, a softmax
+          over every embedding row (frozen T5 embeddings as the classes: no learned
+          classifier or bias, so token types never seen in training stay meaningful). The
+          same random configurations are drawn (infonce -> infonce_vocab); cos / l2 do not
+          depend on candidates. Paper probes keep the paper procedure. Results go to
+          ``results/<run>_vocab/``. The test reports both rates, as always.
+
+Weights: every refit of a selected configuration saves the weights of the probes that
+selected it (``<out dir>/probes/<config>_seed<s>.pt``, listed under "weights" in
+selection.json); ``load_probes`` / ``load_selected`` rebuild them.
+
 Example:
     python -m tokid.selection --features features/elf-b-xsum_t0.3_multidoc.pt
 """
@@ -70,7 +87,7 @@ import torch
 import torch.nn.functional as F
 
 from tokid.extract import resolve_device
-from tokid.probes import BatchedProbe, info_nce_loss, per_layer_loss
+from tokid.probes import BatchedProbe, info_nce_loss, info_nce_vocab_loss, per_layer_loss
 
 PAPER_CONFIGS = {
     f"paper_{arch}_{loss}": {"arch": arch, "depth": 1 if arch == "mlp" else 0, "width": 1000 if arch == "mlp" else 0,
@@ -291,6 +308,8 @@ class QueryData:
         if cfg["loss"] == "infonce":
             d = self.q_doc[idx]
             return info_nce_loss(pred, self.En[self.cand_pad[d]], self.cand_mask[d], self.q_slot[idx], cfg["tau"])
+        if cfg["loss"] == "infonce_vocab":
+            return info_nce_vocab_loss(pred, self.En, self.q_tok[idx], cfg["tau"])
         return per_layer_loss(pred, self.targets(idx).expand(pred.shape[0], -1, -1), cfg["loss"])
 
     @torch.no_grad()
@@ -412,11 +431,16 @@ def protocol_splits(domains, lengths, ood, test_every: int = 5, val_every: int =
 
 # ----------------------------------------------------------------------- configurations
 
-def sample_config(rng) -> dict:
+OBJECTIVES = ("prompt", "vocab")
+
+
+def sample_config(rng, objective: str = "prompt") -> dict:
+    """A random configuration. With ``objective="vocab"`` the same random draws give the
+    same configuration, with the contrastive loss over the whole vocabulary."""
     arch = str(rng.choice(["linear", "affine", "mlp"], p=[0.2, 0.2, 0.6]))
     mlp = arch == "mlp"
     loss = str(rng.choice(["cos", "l2", "infonce"]))
-    return {
+    cfg = {
         "arch": arch, "depth": int(rng.choice([1, 2])) if mlp else 0,
         "width": int(rng.choice([512, 1024, 2048])) if mlp else 0,
         "dropout": float(rng.choice([0.0, 0.1, 0.2])) if mlp else 0.0,
@@ -426,6 +450,9 @@ def sample_config(rng) -> dict:
         "weight_decay": float(rng.choice([0.0, 1e-3, 1e-2, 1e-1])),
         "batch_size": int(rng.choice([256, 1024])),
     }
+    if loss == "infonce" and objective == "vocab":   # after every draw: the random stream is unchanged
+        cfg["loss"] = "infonce_vocab"
+    return cfg
 
 
 def metric_of(cfg):
@@ -487,6 +514,84 @@ class UnitResume:
             self.path.unlink(missing_ok=True)
 
 
+class ProbeWeights:
+    """Saves the trained weights of the selected probes.
+
+    After the refit of configuration c with seed s, the probes that selected c (probe p
+    with chosen[p] == c) are written to ``<root>/<c>_seed<s>.pt``: their slices of the
+    model's parameters and buffers (leading probe dimension), the configuration, the
+    cells each probe reads and their names, the refit epochs and the training seed. The
+    file is written before the unit's checkpoint entry, so a finished unit always has its
+    weights (unless it finished before weight saving existed: then a warning)."""
+
+    def __init__(self, root, cell_names, objective):
+        self.root, self.cell_names, self.objective = Path(root), list(cell_names), objective
+
+    def path(self, c, s):
+        return self.root / f"{c}_seed{s}.pt"
+
+    def save(self, c, s, cfg, model, probes, data, epochs, seed):
+        self.root.mkdir(parents=True, exist_ok=True)
+        idx = torch.as_tensor(probes, dtype=torch.long)
+        state = {k: v.detach()[idx.to(v.device)].cpu().clone() for k, v in model.state_dict().items()}
+        cells = data.cells[idx.to(data.cells.device)].tolist()
+        blob = {"format": "tokid-probes", "config_name": c, "config": dict(cfg), "objective": self.objective,
+                "metric": metric_of(cfg), "seed_index": s, "train_seed": seed, "probes": list(probes),
+                "cells": cells, "cell_names": [[self.cell_names[x] for x in row] for row in cells],
+                "epochs": [int(epochs[p]) for p in probes], "d_in": int(data.x.shape[-1]),
+                "d_out": int(data.E.shape[-1]), "state": state}
+        tmp = self.path(c, s).with_name(self.path(c, s).name + ".tmp")
+        torch.save(blob, tmp)
+        os.replace(tmp, self.path(c, s))
+
+
+def load_probes(path, device="cpu"):
+    """A file written by ``ProbeWeights`` -> one dict per saved probe: ``model`` (a
+    BatchedProbe with a single probe: input (1, B, d_in) or (B, d_in) after [None]),
+    ``probe``, ``cells``, ``cell_names``, ``config``, ``metric`` (cos / l2 nearest
+    neighbours), ``epochs``. Example::
+
+        for e in load_probes("results/elf-b-xsum_t0.3_multidoc_vocab/probes/r07_seed0.pt"):
+            pred = e["model"](hidden[None])[0]          # hidden: (B, 768) states of e["cells"]
+    """
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    if blob.get("format") != "tokid-probes":
+        raise ValueError(f"{path}: not a probe weight file")
+    cfg, st = blob["config"], blob["state"]
+    out = []
+    for j, p in enumerate(blob["probes"]):
+        one = {k: v[j:j + 1] for k, v in st.items()}
+        std = torch.ones(1, blob["d_in"]) if "mean" in one else None
+        model = BatchedProbe(1, blob["d_in"], blob["d_out"], hidden=(cfg["width"],) * cfg["depth"],
+                             bias=cfg["arch"] != "linear", dropout=cfg["dropout"],
+                             mean=torch.zeros(1, blob["d_in"]) if std is not None else None, std=std)
+        model.load_state_dict(one)
+        out.append({"model": model.to(device).eval(), "probe": p, "cells": blob["cells"][j],
+                    "cell_names": blob["cell_names"][j], "config_name": blob["config_name"], "config": cfg,
+                    "metric": blob["metric"], "epochs": blob["epochs"][j], "objective": blob["objective"],
+                    "seed_index": blob["seed_index"]})
+    return out
+
+
+def load_selected(results_dir, seed=0, device="cpu"):
+    """The selected probes of a finished run (``results/<run>/``), refit seed ``seed``:
+    a list indexed by probe (per-layer runs: probe = layer; share-time: probe = layer,
+    reading that layer at every point), each entry as in ``load_probes``."""
+    results_dir = Path(results_dir)
+    res = json.loads((results_dir / "selection.json").read_text())
+    if "weights" not in res:
+        raise ValueError(f"{results_dir}: no saved weights (run made before weight saving existed)")
+    entries = {}
+    for c, files in res["weights"]["files"].items():
+        if seed < len(files) and files[seed] is not None:
+            for e in load_probes(results_dir / files[seed], device):
+                entries[e["probe"]] = e
+    missing = [p for p in range(len(res["chosen"])) if p not in entries]
+    if missing:
+        raise ValueError(f"{results_dir}: no weights for probes {missing} (seed {seed})")
+    return [entries[p] for p in range(len(res["chosen"]))]
+
+
 def _rng_state(dev):
     return {"cpu": torch.get_rng_state(),
             "cuda": torch.cuda.get_rng_state(dev) if dev.type == "cuda" else None}
@@ -505,7 +610,8 @@ def train(cfg, data, train_docs, val_docs=None, seed=0, max_epochs=200, patience
     An epoch is one pass over the probe's training set: every (training query, cell)
     pair of its K cells, in a random order shared by all probes. With ``val_docs``:
     per-probe early stopping on the validation identifiability rate, averaged over the
-    probe's cells (``stop_on="rate"``), or loss (``"loss"``, the paper); each probe keeps
+    probe's cells (``stop_on="rate"``: among the prompt's tokens; ``"vocab"``: top-1 over
+    the whole vocabulary), or loss (``"loss"``, the paper); each probe keeps
     its best epoch's weights. With ``epochs_per_layer`` (refit, no validation): probe p
     keeps its weights after epochs_per_layer[p] epochs. With ``resume`` (a UnitResume)
     and ``key``: the unit's state is saved periodically and a saved state is resumed."""
@@ -556,6 +662,9 @@ def train(cfg, data, train_docs, val_docs=None, seed=0, max_epochs=200, patience
         else:
             if stop_on == "rate":
                 score = data.per_probe(data.correct(model, val_docs, metric_of(cfg)).float().mean(-1))
+            elif stop_on == "vocab":
+                hit = data.vocab_correct(model, val_docs, metric_of(cfg), ks=(1,))[1]
+                score = data.per_probe(hit.float().mean(-1))
             else:
                 score = -data.mean_loss(model, va, cfg)
             take = (score > best) & active
@@ -686,15 +795,19 @@ def per_layer_counts(chosen, counts_by_cfg):
 
 # ---------------------------------------------------------------------------- protocol
 
-def run(data, splits, args, ckpt, rng_seed, resume=None):
+def run(data, splits, args, ckpt, rng_seed, resume=None, weights=None):
     """The protocol with one *probe* as the unit of every choice: halving promotes a
     configuration that ranks high for some probe, each probe picks its own configuration
     by CV, and gets its own refit epochs. Per-layer protocol: probe = layer. Rates are
-    reported per cell, each from the probe that reads it."""
+    reported per cell, each from the probe that reads it. ``args.objective`` sets the
+    validation score of every choice (see the module docstring); ``weights`` (a
+    ProbeWeights) saves the refit probes."""
     G = data.probes
+    objective = getattr(args, "objective", "prompt")
+    stop = "vocab" if objective == "vocab" else "rate"
     rng = np.random.default_rng([args.seed, 11])
     pool = dict(PAPER_CONFIGS)
-    pool.update({f"r{i:02d}": sample_config(rng) for i in range(args.n_random)})
+    pool.update({f"r{i:02d}": sample_config(rng, objective) for i in range(args.n_random)})
     res = {"pool": pool, "rungs": [], "cv": {}, "test": {}}
     seed_of = {c: args.seed * 1000 + i for i, c in enumerate(pool)}
     search = splits["search"]
@@ -707,7 +820,8 @@ def run(data, splits, args, ckpt, rng_seed, resume=None):
             key = f"rung{r}/{c}"
             if ckpt.get(key) is None:
                 _, info = train(pool[c], data, search["train"], search["val"], seed_of[c], max_epochs=budget,
-                                patience=budget, log=f"rung {r} ({budget} ep) {c}", resume=resume, key=key)
+                                patience=budget, stop_on=stop, log=f"rung {r} ({budget} ep) {c}", resume=resume,
+                                key=key)
                 ckpt.put(key, {"val": info["best"], "best_epoch": info["best_epoch"]})
             rung[c] = ckpt.get(key)
         res["rungs"].append(rung)
@@ -723,8 +837,8 @@ def run(data, splits, args, ckpt, rng_seed, resume=None):
             key = f"cv/{c}/fold{f}"
             if ckpt.get(key) is None:
                 _, info = train(pool[c], data, fold["train"], fold["val"], seed_of[c] + 100 * (f + 1),
-                                max_epochs=args.max_epochs, patience=args.patience, log=f"cv {c} fold {f}",
-                                resume=resume, key=key)
+                                max_epochs=args.max_epochs, patience=args.patience, stop_on=stop,
+                                log=f"cv {c} fold {f}", resume=resume, key=key)
                 ckpt.put(key, {"val": info["best"], "best_epoch": info["best_epoch"]})
             folds.append(ckpt.get(key))
         res["cv"][c] = {"val": [f["val"] for f in folds], "best_epoch": [f["best_epoch"] for f in folds],
@@ -739,18 +853,30 @@ def run(data, splits, args, ckpt, rng_seed, resume=None):
     # 4. refit on all dev documents, test once
     seen = torch.unique(data.q_tok[data.queries(splits["dev"])])
     test_sets = {"id": splits["test_id"], "ood": splits["test_ood"]}
-    counts = {}
+    counts, files = {}, {}
     for c in dict.fromkeys(chosen):
         runs = []
+        mine = [p for p in range(G) if chosen[p] == c]
+        files[c] = []
         for s in range(args.seeds):
             key = f"final/{c}/seed{s}"
             if ckpt.get(key) is None:
-                model, _ = train(pool[c], data, splits["dev"], seed=seed_of[c] + 10_000 * (s + 1),
+                seed = seed_of[c] + 10_000 * (s + 1)
+                model, _ = train(pool[c], data, splits["dev"], seed=seed,
                                  epochs_per_layer=res["final_epochs"][c], log=f"final {c} seed {s}",
                                  resume=resume, key=key)
+                if weights is not None:
+                    weights.save(c, s, pool[c], model, mine, data, res["final_epochs"][c], seed)
                 ckpt.put(key, {name: doc_counts(data, model, docs, metric_of(pool[c]), seen)
                                for name, docs in test_sets.items() if docs})
             runs.append(ckpt.get(key))
+            if weights is not None:
+                if weights.path(c, s).is_file():
+                    files[c].append(f"{weights.root.name}/{weights.path(c, s).name}")
+                else:
+                    files[c].append(None)
+                    print(f"  warning: no saved weights for {key} (finished before weight saving existed)",
+                          flush=True)
         counts[c] = {name: mean_counts([r[name] for r in runs]) for name in runs[0]}
 
     # reference: the paper's probes, paper training procedure, same dev / test documents
@@ -777,6 +903,9 @@ def run(data, splits, args, ckpt, rng_seed, resume=None):
             selected[name] = summarize(per_layer_counts(chosen_per_cell, {c: counts[c][name] for c in counts}), data,
                                        docs, rng_b, args.bootstrap)
     res["test"]["selected"] = selected
+    if weights is not None:
+        res["weights"] = {"dir": weights.root.name, "files": files, "seeds": args.seeds,
+                          "note": "probe p of seed s: the file of chosen[p], entry with probe == p (load_selected)"}
     for prefix in ("paper/", "naive/"):
         for key, val in ckpt.units.items():
             if key.startswith(prefix):
@@ -820,6 +949,11 @@ def main(argv=None):
     p.add_argument("--reserve-gb", type=float, default=6.0,
                    help="GPU memory kept free for training on the main GPU; the hidden states fill the other "
                         "visible GPUs first and the main GPU only with what is left.")
+    p.add_argument("--objective", choices=OBJECTIVES, default="prompt",
+                   help="prompt: the paper's task (candidates = the prompt's distinct tokens) for early stopping, "
+                        "halving and CV selection, and contrastive loss over those tokens; vocab: the whole "
+                        "vocabulary (top-1 over every embedding row; contrastive loss over every row). vocab runs "
+                        "write to results/<run>_vocab/ by default.")
     p.add_argument("--n-random", type=int, default=48, help="Random configurations (plus the 4 paper probes).")
     p.add_argument("--rungs", type=int, nargs="+", default=[5, 20], help="Epoch budget of each halving round.")
     p.add_argument("--eta", type=int, default=3, help="Keep 1/eta of the configurations after each round.")
@@ -860,8 +994,9 @@ def main(argv=None):
         prefix = prefix[:prefix.rfind("_")] if "_" in prefix else prefix
         meta.update(tag=args.tag or f"{prefix or 'multi'}_share-{args.share}", variants=tags, share=args.share,
                     layers_per_variant=L, hidden_file=[m["hidden_file"] for m in metas])
-    out = args.out or Path("results") / (f"{meta['tag']}_{meta['dataset']}" if multi else args.features[0].stem) \
-        / "selection.json"
+    suffix = "_vocab" if args.objective == "vocab" else ""
+    out = args.out or Path("results") / ((f"{meta['tag']}_{meta['dataset']}" if multi else args.features[0].stem)
+                                         + suffix) / "selection.json"
     if args.retest and not out.exists():
         p.error(f"--retest: {out} does not exist (run the selection first)")
     if out.exists() and not args.overwrite and not args.retest:
@@ -884,6 +1019,8 @@ def main(argv=None):
     settings["features"] = [str(f) for f in args.features] if multi else str(args.features[0])
     if not multi:
         settings.pop("share")
+    if args.objective == "prompt":   # unchanged settings: runs and checkpoints from before --objective still match
+        settings.pop("objective")
     prev = None
     if args.retest:
         prev = json.loads(out.read_text())
@@ -902,10 +1039,19 @@ def main(argv=None):
     if prev is not None:   # search and CV from the finished run; final and paper units are redone
         ckpt.units.update({k: v for k, v in search_units(prev).items() if k not in ckpt.units})
     resume = UnitResume(unit, settings, every_s=60 * args.unit_save_min)
+    if multi:
+        cell_names = [f"{metas[c // L]['tag']}/layer{c % L}" for c in range(data.num_cells)]
+    else:
+        cell_names = [f"{meta['tag']}/layer{c}" for c in range(data.num_cells)]
+    weights = ProbeWeights(out.parent / "probes", cell_names, args.objective)
+    print(f"[selection] objective={args.objective}: early stopping, halving and CV selection on the "
+          f"{'vocabulary-wide top-1' if args.objective == 'vocab' else 'same-prompt'} validation rate; "
+          f"selected probes' weights -> {weights.root}", flush=True)
     t0 = time.time()
-    res = run(data, splits, args, ckpt, args.seed, resume)
+    res = run(data, splits, args, ckpt, args.seed, resume, weights)
     result = {"meta": meta, "experiment": "selection", "args": settings, "splits": splits,
-              "layers": list(range(data.num_cells)), "elapsed_s": time.time() - t0, **res}
+              "layers": list(range(data.num_cells)), "elapsed_s": time.time() - t0, "objective": args.objective,
+              **res}
     if multi:
         result.update(share=args.share, variants=meta["variants"], layers_per_variant=L,
                       cells=[[c // L, c % L] for c in range(data.num_cells)], probe_cells=cells.tolist())

@@ -199,6 +199,59 @@ Top-1 over the vocabulary can never exceed the same-prompt rate.
   `selection.json`; rows "whole vocabulary" in `summary.md`; figure `selection_vocab`
   (per-point runs) and the vocabulary grids, shared vs dedicated, in the shared runs' summary.
 
+### Whole-vocabulary probes (`multidoc`, `--objective vocab`)
+
+The test above only re-scores probes that were *trained and selected* for the paper's task
+(nearest among the prompt's own tokens). With `--objective vocab` (`OBJECTIVE=vocab` in
+`scripts/run_all.sh` / `slurm/run.sbatch`) the probes are trained and selected for the whole
+vocabulary instead:
+
+* **Every choice uses the vocabulary-wide validation top-1** (the true token is the nearest
+  of all 32,128 rows of the T5 embedding matrix): early stopping, the halving rounds and the
+  per-layer CV selection. `CV val rate` in the summary is that rate.
+* **Contrastive loss over the whole vocabulary** (`infonce_vocab`): a softmax over every
+  embedding row (cosine similarity / temperature) with the true token as the class. The
+  frozen T5 embeddings are the classes (no learned classifier or bias), so token types that
+  never occur as a training target are still scored meaningfully. The loss is computed in
+  blocks of 4096 rows (`tokid.probes.info_nce_vocab_loss`), so it never holds the full
+  (batch × 32k) score matrix: the extra GPU memory is about 1 GB, also in the shared runs.
+* **Same search otherwise:** the same 52 configurations, drawn with the same random numbers;
+  the 1/3 that used the same-prompt contrastive loss use `infonce_vocab` (cos and L2 do not
+  depend on candidates). Same documents, splits, CV folds, seeds, refit and paper probes
+  (paper procedure, unchanged), same test: both rates are reported, as always.
+* **Runs:** the 7 per-point runs (dedicated probes, one per point and layer) and the
+  time-independent shared run (`elf-b-xsum_share-time`, one probe per layer for all 7
+  points). Results go to `results/<run>_multidoc_vocab/` and figures to
+  `figures/<run>_multidoc_vocab/`, so the prompt-objective runs are never overwritten. The
+  shared run's summary compares it with the `_vocab` per-point runs; a per-point summary
+  compares its probes with the prompt-trained ones of the same point (if that run exists),
+  and `selection_vocab` shows those as dashed lines.
+* **Cost:** about 1.5–2× the same-prompt runs on A10/L4/A40/L40s GPUs (the extra cost is a
+  large matrix product per batch plus a vocabulary-wide validation pass per epoch), more on
+  T4s, which the commands below exclude. Not yet measured on AI Cloud.
+
+### Saved probe weights
+
+Every selection run (both objectives) saves the weights of the **selected** probes after each
+refit: `results/<run>/probes/<config>_seed<s>.pt` holds, for configuration `<config>` and
+refit seed `s`, the probes that chose it (per-layer runs: probe = layer; `share-time`:
+probe = layer, read at every point). `selection.json` lists the files under `weights`. Each
+file has the configuration, the cells each probe reads (`cell_names`, e.g.
+`elf-b-xsum_t0.3/layer7`), the refit epochs, the training seed, the nearest-neighbour metric
+(cos / L2) and the parameters (input standardization included). To use them:
+
+```python
+from tokid.selection import load_selected
+probes = load_selected("results/elf-b-xsum_t0.3_multidoc_vocab", seed=0)   # one entry per probe
+e = probes[7]                                   # layer 7
+pred = e["model"](hidden[None])[0]              # hidden: (B, 768) states of layer 7 -> (B, 768) token space
+```
+
+The tests check that the reloaded probes reproduce the reported test rates exactly. Size:
+at most about 30 MB per probe and seed (2 × 2048-unit MLP), so at most ~1.2 GB per run with 3
+seeds, usually much less. Runs that finished before weight saving existed have none (re-run
+the selection to get them).
+
 ### Shared probes: is g time- or layer-independent? (`multidoc`, `--share`)
 
 The selection above trains a separate g for every (trajectory point, layer) pair. Here one g
@@ -306,6 +359,16 @@ MAX_RESTARTS=5 MODELS=elf-xsum-shared DATASETS=multidoc STAGE=select \
   sbatch -p prioritized --time=6-00:00:00 --gres=gpu:2 --mem=48G --array=0-1 \
     --exclude=nv-ai-02,nv-ai-03,a256-t4-01,a256-t4-02,a256-t4-03 slurm/run.sbatch
 
+#    whole-vocabulary probes (--objective vocab; results/<run>_multidoc_vocab/), after the
+#    extraction: the 7 per-point runs (0=t=0, 1-5=t=0.1..0.9, 6=decoder) ...
+OBJECTIVE=vocab MODELS=elf-xsum-inference DATASETS=multidoc STAGE=select \
+  sbatch -p prioritized --time=6-00:00:00 --array=0-6 \
+    --exclude=nv-ai-02,nv-ai-03,a256-t4-01,a256-t4-02,a256-t4-03 slurm/run.sbatch
+#    ... and the time-independent shared run (2 GPUs, as above):
+OBJECTIVE=vocab MAX_RESTARTS=5 MODELS=elf-b-xsum_share-time DATASETS=multidoc STAGE=select \
+  sbatch -p prioritized --time=6-00:00:00 --gres=gpu:2 --mem=48G --array=0 \
+    --exclude=nv-ai-02,nv-ai-03,a256-t4-01,a256-t4-02,a256-t4-03 slurm/run.sbatch
+
 # 3. monitor
 squeue --me
 tail -f logs/tokid_<jobid>_2.out
@@ -320,9 +383,11 @@ tail -f logs/tokid_<jobid>_2.out
   (`scontrol requeue`, at most `MAX_RESTARTS=6` times). Experiments checkpoint after every
   trained probe (`results/.../*.json.partial`), so a restarted job resumes where it stopped;
   finished steps are skipped. If a job dies anyway, submit the same command again.
+  The warning is `SIGUSR1`; `scancel` (`SIGTERM`) stops a job for good, and the same command
+  resumes it later from its checkpoints.
 * Jobs run with `HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1`, since setup
   already downloaded everything. Set `ONLINE=1` to allow downloads.
-* Other variables: `MODELS`, `DATASETS`, `FOLDS`, `EXTRA="--lr-search"`, `CONTAINER`, `VENV`,
+* Other variables: `OBJECTIVE=vocab` (multidoc), `MODELS`, `DATASETS`, `FOLDS`, `EXTRA="--lr-search"`, `CONTAINER`, `VENV`,
   `HF_HOME`, `MAX_RESTARTS`. Also set: `PYTHONNOUSERSITE=1` (ignore `~/.local`),
   `OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK`, `PYTHONUNBUFFERED=1`.
 * AI Cloud: add a partition if your account needs one, e.g. `sbatch -p prioritized --array=0-2 ...`.

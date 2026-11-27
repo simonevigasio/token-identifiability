@@ -33,6 +33,18 @@
 #     MAX_RESTARTS=5 MODELS=elf-xsum-shared DATASETS=multidoc STAGE=select \
 #       sbatch -p prioritized --time=6-00:00:00 --gres=gpu:2 --mem=48G --array=0-1 \
 #       --exclude=nv-ai-02,nv-ai-03,a256-t4-01,a256-t4-02,a256-t4-03 slurm/run.sbatch
+#   Whole-vocabulary probes (tokid.selection --objective vocab: early stopping, halving and CV
+#   selection on the vocabulary-wide top-1, contrastive loss over every embedding row; the
+#   selected probes' weights are saved in results/<run>_multidoc_vocab/probes/). About 1.5-2x
+#   the cost of the same-prompt runs. Per-point (dedicated) probes, one job per point:
+#     OBJECTIVE=vocab MODELS=elf-xsum-inference DATASETS=multidoc STAGE=select \
+#       sbatch -p prioritized --time=6-00:00:00 --array=0-6 \
+#       --exclude=nv-ai-02,nv-ai-03,a256-t4-01,a256-t4-02,a256-t4-03 slurm/run.sbatch
+#       0=t=0, 1-5=t=0.1..0.9, 6=decoder
+#   and the time-independent shared probes (one probe per layer for all 7 points):
+#     OBJECTIVE=vocab MAX_RESTARTS=5 MODELS=elf-b-xsum_share-time DATASETS=multidoc STAGE=select \
+#       sbatch -p prioritized --time=6-00:00:00 --gres=gpu:2 --mem=48G --array=0 \
+#       --exclude=nv-ai-02,nv-ai-03,a256-t4-01,a256-t4-02,a256-t4-03 slurm/run.sbatch
 #
 # AI-LAB allows at most 12 h per job. Shortly before the limit, the job requeues itself
 # (up to MAX_RESTARTS times). The experiments resume from their .partial checkpoints and
@@ -49,7 +61,9 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=24G
 #SBATCH --time=12:00:00
-#SBATCH --signal=B:SIGTERM@600
+# The time-limit warning is USR1, not TERM: scancel sends TERM, and a cancelled job must not
+# requeue itself.
+#SBATCH --signal=B:USR1@600
 
 set -uo pipefail
 source "${SLURM_SUBMIT_DIR:?submit with sbatch from the repository root}/slurm/common.sh"
@@ -65,7 +79,7 @@ DATASETS=${DATASETS:-mrpc}
 export DEVICE=${DEVICE:-cuda}
 export FOLDS=${FOLDS:-10}
 export EXTRA=${EXTRA:-}
-export STAGE=${STAGE:-all} SEL_EXTRA=${SEL_EXTRA:-}   # multidoc (scripts/run_all.sh)
+export STAGE=${STAGE:-all} SEL_EXTRA=${SEL_EXTRA:-} OBJECTIVE=${OBJECTIVE:-prompt}   # multidoc (scripts/run_all.sh)
 MAX_RESTARTS=${MAX_RESTARTS:-6}
 
 # Everything was downloaded by slurm/setup.sh; never touch the network from compute nodes.
@@ -76,9 +90,9 @@ fi
 restarts=$(scontrol show job "$SLURM_JOB_ID" | grep -o 'Restarts=[0-9]*' | cut -d= -f2)
 restarts=${restarts:-0}
 echo "=== $(date) job $SLURM_JOB_ID on $(hostname), restart $restarts/$MAX_RESTARTS"
-echo "models=$MODELS datasets=$DATASETS folds=$FOLDS stage=$STAGE container=$CONTAINER"
+echo "models=$MODELS datasets=$DATASETS folds=$FOLDS stage=$STAGE objective=$OBJECTIVE container=$CONTAINER"
 
-term_handler() {
+limit_handler() {
   echo "=== $(date) time limit approaching"
   if [ "$restarts" -lt "$MAX_RESTARTS" ]; then
     echo "requeueing $SLURM_JOB_ID (progress is checkpointed)"
@@ -88,9 +102,14 @@ term_handler() {
   echo "maximum restarts reached; resubmit the same command to continue"
   exit 1
 }
-trap term_handler SIGTERM
+trap limit_handler USR1
+cancel_handler() {
+  echo "=== $(date) cancelled (scancel or node failure): not requeueing; submit again to resume"
+  exit 143
+}
+trap cancel_handler TERM
 
-# Run in the background and `wait`, so the SIGTERM trap fires immediately.
+# Run in the background and `wait`, so the traps fire immediately.
 # shellcheck disable=SC2086
 srun "${CONTAINER_CMD[@]}" bash -c 'source "$0/bin/activate" && exec bash scripts/run_all.sh "$@"' \
   "$VENV" $DATASETS &

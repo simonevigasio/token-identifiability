@@ -208,3 +208,49 @@ def info_nce_loss(pred, cand, cand_mask, slot, tau: float):
     logits = logits.masked_fill(~cand_mask[None], float("-inf"))
     groups = pred.shape[0]
     return F.cross_entropy(logits.flatten(0, 1), slot.repeat(groups), reduction="none").view(groups, -1).mean(-1)
+
+
+class _VocabCrossEntropy(torch.autograd.Function):
+    """Cross-entropy over every row of a fixed matrix, computed in row chunks.
+
+    Rows z (N, d) are scored against En (V, d): logits = z En^T / tau. The full (N, V)
+    logits are never stored: each chunk's loss and its gradient with respect to z,
+    (softmax - onehot) En / tau, are computed in the forward pass, so memory stays at
+    one (chunk, V) block. Same arithmetic as autograd (one product for the logits, one
+    for the gradient); En gets no gradient (frozen embeddings)."""
+
+    @staticmethod
+    def forward(ctx, z, En, target, tau, chunk):
+        n = z.shape[0]
+        loss = torch.empty(n, dtype=z.dtype, device=z.device)
+        need_grad = ctx.needs_input_grad[0]
+        grad = torch.empty_like(z) if need_grad else None
+        for i in range(0, n, chunk):
+            zi, ti = z[i:i + chunk], target[i:i + chunk]
+            logits = (zi @ En.T).div_(tau)                                    # (c, V)
+            lse = torch.logsumexp(logits, dim=-1)
+            loss[i:i + chunk] = lse - logits.gather(1, ti[:, None])[:, 0]
+            if need_grad:
+                p = logits.sub_(lse[:, None]).exp_()                         # softmax, in place
+                p[torch.arange(ti.numel(), device=z.device), ti] -= 1.0
+                grad[i:i + chunk] = (p @ En).div_(tau)
+        ctx.save_for_backward(grad if need_grad else torch.empty(0))
+        return loss
+
+    @staticmethod
+    def backward(ctx, g):
+        grad, = ctx.saved_tensors
+        return grad * g[:, None], None, None, None, None
+
+
+def info_nce_vocab_loss(pred, En, target, tau: float, chunk: int = 4096):
+    """Per-layer contrastive loss over the **whole vocabulary**: softmax over every row of
+    the embedding matrix (cosine similarity / tau), cross-entropy with the true token.
+
+    pred: (G, B, d); En: (V, d) unit-norm embedding rows (frozen, no learned classifier);
+    target: (B,) token ids. Returns (G,) mean losses. ``chunk`` rows of (G*B) at a time
+    (a chunk of 4096 rows over T5's 32k tokens is a 0.5 GiB block)."""
+    groups, b = pred.shape[0], pred.shape[1]
+    z = F.normalize(pred, dim=-1).reshape(groups * b, -1)
+    loss = _VocabCrossEntropy.apply(z, En.to(z.dtype), target.repeat(groups), float(tau), int(chunk))
+    return loss.view(groups, b).mean(-1)

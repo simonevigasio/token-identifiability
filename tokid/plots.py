@@ -257,10 +257,11 @@ def _seq_cmap():
     return LinearSegmentedColormap.from_list("seq_blue", [SURFACE, SERIES[0], "#0d2f5c"])
 
 
-def fig_selection(res, out):
+def fig_selection(res, out, other=None):
     """Model-selection protocol (tokid.selection): test identifiability per layer of the
     selected g_l (in-distribution and OOD test documents, 95% bootstrap CI) against the
-    paper's probes; per-source and per-length breakdowns of the selected g_l."""
+    paper's probes; per-source and per-length breakdowns of the selected g_l. ``other``:
+    for a whole-vocabulary run, the prompt-objective run (dashed lines in selection_vocab)."""
     layers = np.asarray(res["layers"])
     elf0 = not trivial_layer0({"meta": res["meta"], "configs": {}})
     tag = res["meta"]["tag"]
@@ -311,12 +312,17 @@ def fig_selection(res, out):
                     a = sel[name][field]
                     ax.fill_between(layers, a["lo"], a["hi"], color=color, alpha=0.15, linewidth=0)
                     ax.plot(layers, a["rate"], color=color, marker="o", label=label)
+                o = (other or {}).get("test", {}).get("selected", {}).get(name, {})
+                if field in o:
+                    ax.plot(layers, o[field]["rate"], color=color, linestyle="--", linewidth=1.2,
+                            label=f"{label}, prompt-trained probes")
             xticks(ax, layers, elf0)
             ax.set(xlabel="Layer", ylabel="Test identifiability rate", ylim=(0, 1.02),
                    title=f"{'In-distribution' if name == 'id' else 'OOD'} test")
             ax.title.set_fontsize(9)
         axes[0][0].legend(title="candidates", loc="lower left")
-        fig.suptitle(f"Selected g_l: prompt tokens vs whole vocabulary - {tag}", fontsize=9)
+        how = "trained on the whole vocabulary" if objective_of(res) == "vocab" else "trained on prompt tokens"
+        fig.suptitle(f"Selected g_l ({how}): prompt tokens vs whole vocabulary - {tag}", fontsize=9)
         save(fig, out, "selection_vocab")
 
     by_len = sel.get("id", {}).get("by_length") or {}
@@ -340,6 +346,37 @@ SHARE_TEXT = {
 }
 
 
+OBJECTIVE_TEXT = {
+    "prompt": "Training objective: the paper's task (early stopping, halving and CV selection on the rate among "
+              "the prompt's own tokens; contrastive loss over those tokens).",
+    "vocab": "Training objective: the whole vocabulary (early stopping, halving and CV selection on the "
+             "vocabulary-wide validation top-1; contrastive loss `infonce_vocab` over every embedding row). "
+             "\"CV val rate\" below is that vocabulary-wide rate.",
+}
+
+
+def objective_of(res):
+    return res.get("objective", "prompt")
+
+
+def run_dir(tag, dataset, objective):
+    """results/ folder name of a selection run: <tag>_<dataset>, plus _vocab for --objective vocab."""
+    return f"{tag}_{dataset}" + ("_vocab" if objective == "vocab" else "")
+
+
+def load_prompt_run(res, root):
+    """For a whole-vocabulary run: the prompt-objective run of the same features and
+    documents (results/<tag>_<dataset>/selection.json), if present."""
+    if objective_of(res) != "vocab":
+        return None
+    f = Path(root) / run_dir(res["meta"]["tag"], res["meta"]["dataset"], "prompt") / "selection.json"
+    if f.is_file():
+        other = load(f)
+        if other.get("splits") == res["splits"] and objective_of(other) == "prompt":
+            return other
+    return None
+
+
 def is_shared(res):
     return "variants" in res
 
@@ -352,13 +389,15 @@ def variant_names(tags):
 
 
 def load_baseline(res, root):
-    """The dedicated per-layer runs of each point (results/<tag>_<dataset>/selection.json), if present."""
+    """The dedicated per-layer runs of each point with the same objective
+    (results/<tag>_<dataset>[_vocab]/selection.json), if present."""
     out = {}
     for tag in res["variants"]:
-        f = Path(root) / f"{tag}_{res['meta']['dataset']}" / "selection.json"
+        f = Path(root) / run_dir(tag, res["meta"]["dataset"], objective_of(res)) / "selection.json"
         if f.is_file():
             b = load(f)
-            if b.get("splits") == res["splits"]:  # same documents, else not comparable
+            # same documents and the same objective, else not comparable
+            if b.get("splits") == res["splits"] and objective_of(b) == objective_of(res):
                 out[tag] = b
     return out
 
@@ -467,6 +506,7 @@ def shared_summary(name, res, base):
              f"rounds {res['args']['rungs']} epochs, {len(res['finalists'])} finalists, "
              f"{res['args']['cv_folds']}-fold CV; refit with {res['args']['seeds']} seeds. "
              "Test rate [95% bootstrap CI over prompts]; row = point, column = layer.", "",
+             OBJECTIVE_TEXT[objective_of(res)], "",
              "Selected configuration per probe (CV mean validation rate over its cells, optimistic):", "",
              "| probe | cells | config | CV val rate |", "|---|---|---|---|"]
     for p, (cells, c, v) in enumerate(zip(res["probe_cells"], res["chosen"], res["chosen_cv_rate"])):
@@ -524,7 +564,7 @@ def describe_config(cfg):
         extra.append(f"dropout {cfg['dropout']:g}")
     if cfg["standardize"]:
         extra.append("std. input")
-    loss = cfg["loss"] + (f" (tau {cfg['tau']:.3f})" if cfg["loss"] == "infonce" else "")
+    loss = cfg["loss"] + (f" (tau {cfg['tau']:.3f})" if cfg.get("tau") is not None else "")
     return f"{arch}, {loss}, " + ", ".join(extra)
 
 
@@ -532,7 +572,7 @@ VOCAB_ROWS = (("vocab_top1", "whole vocabulary top-1"), ("vocab_top5", "whole vo
               ("vocab_top1_unseen", "whole vocabulary top-1, unseen token types"))
 
 
-def selection_summary(name, res):
+def selection_summary(name, res, other=None):
     layers = res["layers"]
     head = "| | " + " | ".join(str(l) for l in layers) + " |"
     sep = "|---" * (len(layers) + 1) + "|"
@@ -551,6 +591,7 @@ def selection_summary(name, res):
              "Candidates: the distinct tokens of the same prompt (as in the paper); rows marked \"whole "
              "vocabulary\" use every row of the T5 embedding matrix instead (top-k: the true token among the "
              "k nearest).", "",
+             OBJECTIVE_TEXT[objective_of(res)], "",
              "Selected configuration per layer (CV mean validation rate is optimistic, it was maximised):", "",
              "| layer | config | CV val rate |", "|---|---|---|"]
     for l, (c, v) in enumerate(zip(res["chosen"], res["chosen_cv_rate"])):
@@ -572,6 +613,21 @@ def selection_summary(name, res):
                 lines.append(row(f"{key}, {test}", val[test]["all"]))
                 if "vocab_top1" in val[test]:
                     lines.append(row(f"{key}, {test}, whole vocabulary top-1", val[test]["vocab_top1"]))
+    if other is not None:
+        lines += ["", "Whole-vocabulary training vs the probes selected with the paper's objective "
+                  "(prompt-objective run of the same features and documents):", "", head, sep]
+        for test in ("id", "ood"):
+            a, b = res["test"]["selected"].get(test), other["test"]["selected"].get(test)
+            if not a or not b:
+                continue
+            for field, text in (("vocab_top1", "whole vocabulary top-1"), ("vocab_top5", "whole vocabulary top-5"),
+                                ("all", "among the prompt's tokens")):
+                if field in a and field in b:
+                    lines.append(row(f"vocab-trained, {test}, {text}", a[field]))
+                    lines.append(row(f"prompt-trained, {test}, {text}", b[field]))
+                    lines.append(f"| difference (pp), {test}, {text} | "
+                                 + " | ".join(f"{100 * (x - y):+.2f}" for x, y in zip(a[field]["rate"],
+                                                                                    b[field]["rate"])) + " |")
     for test in ("id", "ood"):
         sel = res["test"]["selected"].get(test)
         if not sel:
@@ -596,7 +652,7 @@ def table(res, configs, layers, key="test_mean"):
     return "\n".join(rows)
 
 
-def summary(results, out, baselines=None):
+def summary(results, out, baselines=None, others=None):
     lines = ["# Token identifiability results", "",
              "Test identifiability rate: fraction of tokens whose nearest same-sentence (same-prompt) "
              "neighbour is the correct one. Column = layer (0 = input to the first block). Cross-validated "
@@ -606,7 +662,7 @@ def summary(results, out, baselines=None):
             lines += shared_summary(name, res, (baselines or {}).get(name, {}))
             continue
         if res["experiment"] == "selection":
-            lines += selection_summary(name, res)
+            lines += selection_summary(name, res, (others or {}).get(name))
             continue
         m = res["meta"]
         lines += [f"## {name}: {title_of(res)}", "",
@@ -649,7 +705,7 @@ def main(argv=None):
     for path in args.results:
         files = sorted(path.glob("*.json")) if path.is_dir() else [path]
         out = args.out or Path("figures") / (path.name if path.is_dir() else path.parent.name)
-        results, baselines = {}, {}
+        results, baselines, others = {}, {}, {}
         for f in files:
             res = load(f)
             results[f.stem] = res
@@ -662,12 +718,13 @@ def main(argv=None):
                 baselines[f.stem] = load_baseline(res, f.parent.parent)  # results/<tag>_<dataset>/ next to it
                 fig_shared(res, sub, baselines[f.stem])
             elif res["experiment"] == "selection":
-                fig_selection(res, sub)
+                others[f.stem] = load_prompt_run(res, f.parent.parent)
+                fig_selection(res, sub, others[f.stem])
             else:
                 fig_neighbours(res, sub)
         if results:
             out.mkdir(parents=True, exist_ok=True)
-            summary(results, out, baselines)
+            summary(results, out, baselines, others)
             fig_generalization(results, out / "generalization")
             print(f"wrote {out} ({len(results)} result files)")
 
